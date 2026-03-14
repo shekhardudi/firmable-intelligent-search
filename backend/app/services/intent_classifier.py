@@ -49,6 +49,16 @@ class QueryIntent(BaseModel):
         default=None,
         description="Type of external data needed: 'news', 'funding', 'events', etc."
     )
+    field_boosts: Dict[str, float] = Field(
+        default_factory=dict,
+        description=(
+            "Per-field boost multipliers for the OpenSearch multi_match clause. "
+            "Only populated for SEMANTIC queries. "
+            "Keys: name, domain, industry, searchable_text, locality. "
+            "Values: boost multiplier (e.g. 3.0 = 3x weight). "
+            "Empty dict means fall back to hardcoded defaults."
+        )
+    )
     reasoning: str = Field(
         description="Brief reasoning for the classification decision"
     )
@@ -134,36 +144,79 @@ CRITICAL RULES:
 - Always extract location into THREE separate keys: location_country, location_state, location_city
   - "california" → location_country="United States", location_state="California"
   - "new york" → location_country="United States", location_state="New York" (or location_city="New York" if clearly a city)
+  - "united states" / "usa" / "us" / "america" → location_country="United States", location_state=null
   - "germany" → location_country="Germany"
   - "london" → location_country="United Kingdom", location_city="London"
+  - "australia" → location_country="Australia", location_state=null
+  - Always preserve the FULL English country name (e.g. "United States" not "US", "United Kingdom" not "UK")
+- If query contains industry keywords, extract into "industry" key (e.g., "healthcare", "finance", "technology")
+- If query contains year references (e.g., "founded before 2000", "established after 2010"), extract into "year_from" and "year_to"
+- If query contains company size references (e.g., "startups", "large enterprises", "100-500 employees"), extract into "size_range" key
+- If query contains funding or event references, set needs_external_data=true and external_data_type to 'funding' or 'events' accordingly
+- If Country is mentioned without state, assume location_state=null but still classify as SEMANTIC (e.g., "tech companies in germany" → SEMANTIC with location_country="Germany", location_state=null)
+- If any part of location is mentioned extract it, but do not let location alone determine SEMANTIC vs REGULAR (e.g., "california" alone should be REGULAR, but "apple in california" should be SEMANTIC)
 - Extract industry as a canonical label (e.g. "technology", "healthcare", "finance")
-- Provide a normalized search_query string stripping location/filter values
+- If query mentions country without state, extract country but do not assume state (e.g., "tech companies in united states" → location_country="United States", location_state=null)
 
-Return structured JSON with confidence, filters, and reasoning."""
+FIELD BOOSTING (SEMANTIC queries only):
+For SEMANTIC queries, you must also populate field_boosts — a dict controlling how much each OpenSearch field is weighted in the multi_match clause. The fields and their roles are:
+  - "name":            the company's registered name  (boost high when user mentions a specific name pattern)
+  - "domain":          the company's website domain   (boost high when user mentions web/tech/online presence)
+  - "industry":        the industry label             (boost high when query is about an industry type)
+  - "searchable_text": enriched text with taxonomy, tags, descriptions (boost high for broad conceptual queries)
+  - "locality":        city/region where the company operates (boost high when query mentions a sub-country location)
+
+Field boost rules:
+  - Scale: use values between 1.0 (neutral) and 5.0 (very strong). Never use 0 or negative.
+  - Every field must appear in field_boosts — do not omit any.
+  - Default neutral value is 1.0. Use it for fields not relevant to the query intent.
+
+Field boost examples:
+  "AI companies in healthcare"
+    → industry: 4.0, searchable_text: 3.0, name: 1.0, domain: 1.0, locality: 1.0
+  "fintech startups in London"
+    → industry: 3.0, locality: 3.0, searchable_text: 2.0, name: 1.0, domain: 1.0
+  "companies like Stripe or Plaid"
+    → name: 4.0, domain: 3.0, industry: 2.0, searchable_text: 2.0, locality: 1.0
+  "sustainable energy companies"
+    → industry: 4.0, searchable_text: 3.5, domain: 2.0, name: 1.0, locality: 1.0
+  "B2B SaaS platforms with enterprise clients"
+    → searchable_text: 4.0, industry: 3.0, domain: 2.0, name: 1.0, locality: 1.0
+  "biotech firms near Boston"
+    → industry: 3.0, locality: 4.0, searchable_text: 2.0, name: 1.0, domain: 1.0
+
+For REGULAR or AGENTIC queries, return field_boosts as an empty dict {{}}.
+
+Full country-name extraction examples:
+  "tech companies in united states" → category=semantic, filters={{location_country="United States", location_state=null, industry="technology"}}, field_boosts={{industry:3.0, searchable_text:3.0, name:1.0, domain:1.0, locality:1.0}}
+  "healthcare startups in usa" → category=semantic, filters={{location_country="United States", location_state=null, industry="healthcare"}}, field_boosts={{industry:4.0, searchable_text:3.0, name:1.0, domain:1.0, locality:1.0}}
+
+Return structured JSON with confidence, filters, field_boosts, search_query, and reasoning."""
 
         user_prompt = f"""Classify this query: "{query}"
 
-Return a JSON object with:
+Return a JSON object with ALL of these keys:
 - category: regular|semantic|agentic
 - confidence: 0.0-1.0
+- search_query: the cleaned query string with location/filter words stripped (e.g. "tech companies" not "tech companies in united states")
 - filters: {{
-    "location_country": "...",   // country name or null
+    "location_country": "...",   // full English country name ("United States", "Germany") or null
     "location_state": "...",     // state/province or null
     "location_city": "...",      // city or null
-    "industry": "...",           // industry label or null
-    "year_from": null,
-    "year_to": null,
-    "size_range": null
+    "industry": "...",           // canonical industry label or null
+    "year_from": null,           // integer year or null
+    "year_to": null,             // integer year or null
+    "size_range": null           // e.g. "1-10", "startups", or null
   }}
-- search_query: normalized query string (strip location/filter words)
 - needs_external_data: true/false
-- external_data_type: null or 'news'|'funding'|'events'
-- reasoning: 1-2 sentence explanation of classification"""
+- external_data_type: null or "news"|"funding"|"events"
+- field_boosts: {{"name": 1.0, "domain": 1.0, "industry": 1.0, "searchable_text": 1.0, "locality": 1.0}}  // adjust values for SEMANTIC; return empty {{}} for REGULAR/AGENTIC
+- reasoning: 1-2 sentence explanation"""
 
         try:
             response = self.client.messages.create(
                 model=self.model,
-                max_tokens=500,
+                max_tokens=1000,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
@@ -205,17 +258,19 @@ Return a JSON object with:
             filters={},
             search_query="",
             needs_external_data=False,
+            field_boosts={},
             reasoning="Empty query - returning empty intent"
         )
     
     def _semantic_fallback_intent(self, query: str) -> QueryIntent:
-        """Fallback for classification errors - default to semantic"""
+        """Fallback for classification errors - default to semantic, use hardcoded defaults"""
         return QueryIntent(
             category=SearchIntent.SEMANTIC,
             confidence=0.5,
             filters={},
             search_query=query,
             needs_external_data=False,
+            field_boosts={},  # empty → SemanticSearchStrategy will apply _DEFAULT_FIELD_BOOSTS
             reasoning="Classification error - defaulting to semantic search"
         )
     

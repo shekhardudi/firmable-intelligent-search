@@ -40,6 +40,7 @@ class SearchContext:
     limit: int = 20
     page: int = 1
     include_reasoning: bool = True
+    field_boosts: Optional[Dict[str, float]] = None  # LLM-extracted per-field boost multipliers (semantic only)
 
 
 class SearchStrategy(ABC):
@@ -264,7 +265,18 @@ class SemanticSearchStrategy(SearchStrategy):
     Best for: Natural language, synonyms, conceptual queries.
     Uses msmarco-distilbert embeddings for semantic similarity.
     """
-    
+
+    # Fallback field boosts used when the classifier returns an empty dict.
+    # These mirror the historical hardcoded values so behaviour is unchanged
+    # for queries that don't benefit from dynamic boosting.
+    _DEFAULT_FIELD_BOOSTS: Dict[str, float] = {
+        "name": 2.0,
+        "domain": 1.0,
+        "searchable_text": 2.0,
+        "industry": 1.0,
+        "locality": 1.0,
+    }
+
     def __init__(self, opensearch_service, embedding_service):
         """Initialize with OpenSearch and embedding service"""
         self.opensearch = opensearch_service
@@ -303,13 +315,15 @@ class SemanticSearchStrategy(SearchStrategy):
             results = self._process_results(response, context)
             
             execution_time = time.time() - start_time
+            effective_boosts = self._resolve_field_boosts(context)
             metadata = {
                 "strategy": self.strategy_type,
                 "total_hits": response.get("hits", {}).get("total", {}).get("value", 0),
                 "returned": len(results),
                 "execution_time_ms": int(execution_time * 1000),
                 "embedding_dim": len(embedding) if embedding else 0,
-                "score_range": self._get_score_range(results)
+                "score_range": self._get_score_range(results),
+                "field_boosts_applied": effective_boosts,
             }
             
             logger.info(
@@ -328,16 +342,57 @@ class SemanticSearchStrategy(SearchStrategy):
             )
             raise
     
+    def _resolve_field_boosts(self, context: SearchContext) -> Dict[str, float]:
+        """Merge LLM-extracted boosts with defaults.
+
+        The classifier's values take precedence; any field not specified by the
+        classifier falls back to _DEFAULT_FIELD_BOOSTS.  This guarantees all
+        five fields are always present and the query never omits a field.
+        """
+        classifier_boosts = context.field_boosts or {}
+        if not classifier_boosts:
+            return dict(self._DEFAULT_FIELD_BOOSTS)
+        # Start from defaults, override with whatever the classifier provided
+        merged = dict(self._DEFAULT_FIELD_BOOSTS)
+        for field, boost in classifier_boosts.items():
+            if field in merged and isinstance(boost, (int, float)) and boost > 0:
+                merged[field] = float(boost)
+        return merged
+
+    @staticmethod
+    def _boosts_to_fields(boosts: Dict[str, float]) -> List[str]:
+        """Convert a boost dict to the OpenSearch fields list format.
+
+        Fields with a boost of exactly 1.0 are emitted without a suffix so the
+        query stays clean (OpenSearch treats bare field names as ^1).
+        """
+        fields = []
+        for field, boost in boosts.items():
+            if boost == 1.0:
+                fields.append(field)
+            else:
+                fields.append(f"{field}^{boost:g}")
+        return fields
+
     def _build_hybrid_query(self, context: SearchContext, embedding: List[float]) -> Dict[str, Any]:
-        """Build OpenSearch hybrid query combining BM25 + kNN."""
+        """Build OpenSearch hybrid query combining BM25 + kNN.
+
+        The multi_match field weights are driven by LLM-extracted field_boosts
+        so that queries about industries, locations, company names, etc. are
+        scored with appropriate emphasis on the most relevant fields.
+        """
         filter_clauses = self._build_filters(context.filters)
+        effective_boosts = self._resolve_field_boosts(context)
+        boosted_fields = self._boosts_to_fields(effective_boosts)
 
         bool_query: Dict[str, Any] = {
             "should": [
                 {
                     "multi_match": {
                         "query": context.optimized_query,
-                        "fields": ["name^2", "domain", "searchable_text^2", "industry", "locality"],
+                        "fields": boosted_fields,
+                        "type": "best_fields",
+                        "operator": "or",
                     }
                 },
                 {

@@ -130,7 +130,8 @@ class SearchOrchestrator:
                 confidence=intent.confidence,
                 limit=limit,
                 page=page,
-                include_reasoning=include_reasoning
+                include_reasoning=include_reasoning,
+                field_boosts=intent.field_boosts or None,
             )
             
             # Step 3: Select and execute strategy
