@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     OPENSEARCH_PASSWORD: str = "MySecurePassword123!"
     OPENSEARCH_SCHEME: str = "https"
     OPENSEARCH_VERIFY_CERTS: bool = False
-    OPENSEARCH_INDEX_NAME: str = "companies"
+    OPENSEARCH_INDEX_NAME: str = "companies-new"
     OPENSEARCH_SIZE_LIMIT: int = 10000
     
     # OpenAI Configuration

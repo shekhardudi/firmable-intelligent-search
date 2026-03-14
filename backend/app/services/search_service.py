@@ -8,6 +8,7 @@ from functools import lru_cache
 from typing import Dict, List, Any, Optional, Tuple
 from app.services.opensearch_service import get_opensearch_service
 from app.services.llm_service import get_llm_service
+from app.services.embedding_service import get_embedding_service
 from app.models.search import (
     BasicSearchRequest, BasicSearchResponse, CompanySearchResult,
     IntelligentSearchRequest, IntelligentSearchResponse,
@@ -28,6 +29,7 @@ class SearchService:
         self.settings = get_settings()
         self.opensearch = get_opensearch_service()
         self.llm = get_llm_service()
+        self.embeddings = get_embedding_service()
         self.index_name = self.settings.OPENSEARCH_INDEX_NAME
     
     # ========================================================================
@@ -382,8 +384,8 @@ class SearchService:
         start_time = time.time()
         
         try:
-            # Generate embedding for query
-            query_embedding = self.llm.generate_embedding(request.query)
+            # Generate embedding using local SentenceTransformer (msmarco-distilbert-base-tas-b)
+            query_embedding = self.embeddings.embed(request.query)
             
             # Vector search in OpenSearch
             vector_results = self.opensearch.vector_search(
