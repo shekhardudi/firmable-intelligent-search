@@ -1,0 +1,58 @@
+# OpenTelemetry Collector configuration for Firmable Intelligent Search.
+#
+# Data flow:
+#   App (OTLP/gRPC :4317)
+#     → receivers/otlp
+#     → processors/batch
+#     → exporters/prometheus (metrics scraped by Prometheus on :8888)
+#     → exporters/otlp/jaeger (traces forwarded to Jaeger on :4317)
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+  # Drop high-cardinality attributes that bloat Prometheus
+  attributes/sanitize:
+    actions:
+      - key: net.peer.ip
+        action: delete
+      - key: http.user_agent
+        action: delete
+
+exporters:
+  # Expose Prometheus scrape endpoint on :8888/metrics
+  prometheus:
+    endpoint: "0.0.0.0:8888"
+    namespace: firmable
+    send_timestamps: true
+    metric_expiration: 3m
+
+  # Forward traces to Jaeger via OTLP/gRPC
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  # Debug exporter — logs to collector stdout (useful in development)
+  debug:
+    verbosity: normal
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [batch, attributes/sanitize]
+      exporters: [prometheus, debug]

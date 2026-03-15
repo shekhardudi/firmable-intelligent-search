@@ -101,6 +101,8 @@ services:
       - DATABASE_URL=postgresql://firmable_user:password123@postgres:5432/firmable_search
       - REDIS_URL=redis://redis:6379/0
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OTLP_ENDPOINT=http://otel-collector:4317
+      - OTEL_SERVICE_NAME=firmable-search
     depends_on:
       opensearch-node1:
         condition: service_started
@@ -136,10 +138,77 @@ services:
       - VITE_API_URL=http://localhost:8000
     command: npm run dev
 
+  # =========================================================================
+  # Observability Stack
+  # =========================================================================
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.104.0
+    container_name: firmable-otel-collector
+    command: ["--config=/etc/otelcol/otelcol-config.yaml"]
+    volumes:
+      - ./infrastructure/otel-collector/otelcol-config.yaml:/etc/otelcol/otelcol-config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC (app → collector)
+      - "4318:4318"   # OTLP HTTP
+      - "8888:8888"   # Prometheus scrape endpoint
+    networks:
+      - search-network
+    depends_on:
+      - jaeger
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: firmable-prometheus
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    networks:
+      - search-network
+    depends_on:
+      - otel-collector
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.58
+    container_name: firmable-jaeger
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "14317:4317"    # OTLP gRPC (mapped to host 14317 to avoid clash)
+    networks:
+      - search-network
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: firmable-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./infrastructure/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infrastructure/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    networks:
+      - search-network
+    depends_on:
+      - prometheus
+      - jaeger
+
 volumes:
   opensearch-data:
   postgres-data:
   redis-data:
+  prometheus-data:
+  grafana-data:
 
 networks:
   search-network:

@@ -14,6 +14,7 @@ import os
 import structlog
 from typing import Any
 from openai import OpenAI
+from app.config import get_settings, get_search_config
 
 logger = structlog.get_logger(__name__)
 
@@ -26,10 +27,17 @@ class ToolService:
     """
 
     def __init__(self, opensearch_service, api_key: str, model: str = "gpt-4o-mini"):
+        _cfg = get_search_config().get("agentic", {})
         self.opensearch = opensearch_service
         self.client = OpenAI(api_key=api_key)
         self.model = model
         self._tavily_key: str | None = os.getenv("TAVILY_API_KEY")
+        self._max_company_names: int = int(_cfg.get("max_company_names", 20))
+        self._llm_max_tokens: int = int(_cfg.get("llm_max_tokens", 400))
+        self._resolve_per_name: int = int(_cfg.get("resolve_per_name", 2))
+        self._min_resolve_score: float = float(_cfg.get("min_resolve_score", 1.0))
+        self._tavily_max_results: int = int(_cfg.get("tavily_max_results", 5))
+        self._tavily_timeout_s: int = int(_cfg.get("tavily_timeout_s", 8))
 
     # ------------------------------------------------------------------
     # Public API
@@ -75,7 +83,7 @@ class ToolService:
             prompt += f"\nRecent web context:\n{context_snippet}\n"
 
         prompt += (
-            "\nList up to 20 real company names that best match this query. "
+            f"\nList up to {self._max_company_names} real company names that best match this query. "
             "Return ONLY a JSON array of company name strings, nothing else. "
             'Example: ["Company A", "Company B"]'
         )
@@ -84,7 +92,7 @@ class ToolService:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=400,
+                max_tokens=self._llm_max_tokens,
                 temperature=0,
             )
             content = response.choices[0].message.content.strip()
@@ -116,7 +124,7 @@ class ToolService:
         for name in names:
             try:
                 resp = self.opensearch.search(
-                    index="companies",
+                    index=get_settings().OPENSEARCH_INDEX_NAME,
                     query={
                         "multi_match": {
                             "query": name,
@@ -125,13 +133,12 @@ class ToolService:
                             "fuzziness": "AUTO",
                         }
                     },
-                    size=2,
+                    size=self._resolve_per_name,
                 )
                 for hit in resp.get("hits", {}).get("hits", []):
                     doc_id = hit.get("_id")
                     score = float(hit.get("_score", 0))
-                    # Require a minimum score to avoid false matches
-                    if doc_id not in seen_ids and score > 1.0:
+                    if doc_id not in seen_ids and score > self._min_resolve_score:
                         seen_ids.add(doc_id)
                         results.append(
                             {**hit["_source"], "_id": doc_id, "_score": score}
@@ -154,8 +161,8 @@ class ToolService:
 
         resp = requests.post(
             "https://api.tavily.com/search",
-            json={"api_key": self._tavily_key, "query": query, "max_results": 5},
-            timeout=8,
+            json={"api_key": self._tavily_key, "query": query, "max_results": self._tavily_max_results},
+            timeout=self._tavily_timeout_s,
         )
         resp.raise_for_status()
         data = resp.json()

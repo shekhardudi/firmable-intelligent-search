@@ -132,16 +132,28 @@ class OpenSearchService:
         The client-level timeout (30 s) is used; no per-request timeout
         string is passed so urllib3 never receives an invalid value.
         """
+        import time as _time
         try:
             if body is not None:
                 request_body = {**body, "size": size, "from": from_}
             else:
                 request_body = {"query": query, "size": size, "from": from_}
 
+            _t0 = _time.perf_counter()
             response = self.client.search(
                 index=index,
                 body=request_body,
             )
+            _duration_ms = int((_time.perf_counter() - _t0) * 1000)
+
+            try:
+                from app.observability.metrics import get_search_metrics
+                get_search_metrics()["opensearch_query_duration_ms"].record(
+                    _duration_ms, {"index": index}
+                )
+            except Exception:
+                pass  # metrics must never break the query path
+
             logger.debug(
                 "search_executed",
                 hits=len(response["hits"]["hits"]),

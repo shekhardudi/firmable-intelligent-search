@@ -1,0 +1,46 @@
+rrf:
+  k: 60
+  knn_k: 100
+  fetch_multiplier: 4
+
+field_boosts:
+  defaults:                 # SemanticSearchStrategy._DEFAULT_FIELD_BOOSTS
+    name: 2.0
+    domain: 1.0
+    searchable_text: 2.0
+    industry: 1.0
+    locality: 1.0
+  bm25_regular:             # RegularSearchStrategy _build_bm25_query field weights
+    name: 2.0
+    domain: 2.0
+    searchable_text: 1.0
+    industry: 1.0
+    locality: 1.0
+
+cache:
+  embedding_maxsize: 512
+  classifier_maxsize: 256
+
+embedding:
+  # Sentence-transformers model name or local path.
+  # Override with EMBEDDING_MODEL env var or by editing here.
+  model: BAAI/bge-base-en-v1.5
+  # Vector dimension produced by the model.
+  dimension: 768
+  # Asymmetric retrieval prefix added to queries (not documents).
+  # Set to empty string "" for symmetric models (e.g. all-MiniLM).
+  query_prefix: "Represent this sentence for searching relevant passages: "
+
+agentic:
+  # Maximum company names the LLM may return per extraction call
+  max_company_names: 20
+  # Token budget for the LLM name-extraction call
+  llm_max_tokens: 400
+  # OpenSearch candidates to fetch per resolved company name
+  resolve_per_name: 2
+  # Minimum OpenSearch score to accept a resolved company (avoids false matches)
+  min_resolve_score: 1.0
+  # Tavily web-search max results (only used when TAVILY_API_KEY is set)
+  tavily_max_results: 5
+  # Tavily HTTP request timeout in seconds
+  tavily_timeout_s: 8

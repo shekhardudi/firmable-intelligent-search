@@ -7,6 +7,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
+from app.config import get_settings, get_search_config
 
 logger = structlog.get_logger(__name__)
 
@@ -77,6 +78,13 @@ class SearchStrategy(ABC):
         return {"min": min(scores), "max": max(scores)}
 
     @staticmethod
+    def _boosts_to_fields(boosts: Dict[str, float]) -> List[str]:
+        """Convert a boost dict to OpenSearch fields list format.
+        Fields with boost 1.0 are emitted without a suffix (cleaner query).
+        """
+        return [f if b == 1.0 else f"{f}^{b:g}" for f, b in boosts.items()]
+
+    @staticmethod
     def _build_filters(filters: Dict[str, Any]) -> List[Dict]:
         """
         Shared helper: convert the unified filters dict into OpenSearch filter clauses.
@@ -89,7 +97,15 @@ class SearchStrategy(ABC):
 
         # Location filters
         if country := filters.get("location_country"):
-            clauses.append({"term": {"country": country.lower()}})
+            clauses.append({
+                "bool": {
+                    "should": [
+                        {"term": {"country": country.lower()}},
+                        {"term": {"country_tags": country.lower()}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            })
         if state := filters.get("location_state"):
             clauses.append({"term": {"state": state.lower()}})
         if city := filters.get("location_city"):
@@ -103,19 +119,30 @@ class SearchStrategy(ABC):
                 }
             })
 
-        # Industry filter
-        if industry := filters.get("industry"):
-            # Match against industry text OR any of the stored synonym tags
-            clauses.append({
-                "bool": {
-                    "should": [
-                        {"match": {"industry": {"query": industry, "fuzziness": "AUTO"}}},
-                        {"term": {"industry_tags": industry.lower()}},
-                        {"match": {"searchable_text": industry}},
-                    ],
-                    "minimum_should_match": 1,
+        # Industry filter — handles both a list (from UI multi-select) and a single string
+        # (from the LLM classifier).  For a list, build one should-clause per industry
+        # and wrap them in an outer should so any match is sufficient.
+        industries: List[str] = filters.get("industries") or []
+        if not industries and filters.get("industry"):
+            industries = [filters["industry"]]  # normalise single string to list
+        if industries:
+            per_industry = [
+                {
+                    "bool": {
+                        "should": [
+                            {"match": {"industry": {"query": ind, "fuzziness": "AUTO"}}},
+                            {"term": {"industry_tags": ind.lower()}},
+                            {"match": {"searchable_text": ind}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
                 }
-            })
+                for ind in industries
+            ]
+            if len(per_industry) == 1:
+                clauses.append(per_industry[0])
+            else:
+                clauses.append({"bool": {"should": per_industry, "minimum_should_match": 1}})
 
         # Year filters
         year_range: Dict[str, Any] = {}
@@ -165,7 +192,7 @@ class RegularSearchStrategy(SearchStrategy):
         try:
             # Execute search
             response = self.opensearch.search(
-                index="companies",
+                index=get_settings().OPENSEARCH_INDEX_NAME,
                 query=query_body["query"],
                 size=context.limit,
                 from_=(context.page - 1) * context.limit
@@ -200,29 +227,28 @@ class RegularSearchStrategy(SearchStrategy):
             raise
     
     def _build_bm25_query(self, context: SearchContext) -> Dict[str, Any]:
-        """Build OpenSearch BM25 query"""
+        """Build OpenSearch BM25 query with field boosts from config."""
+        cfg = get_search_config().get("field_boosts", {}).get("bm25_regular", {})
+        boosts = {
+            "name": float(cfg.get("name", 2.0)),
+            "domain": float(cfg.get("domain", 2.0)),
+            "searchable_text": float(cfg.get("searchable_text", 1.0)),
+            "industry": float(cfg.get("industry", 1.0)),
+            "locality": float(cfg.get("locality", 1.0)),
+        }
         must_clauses = []
-        
-        # Main text search with BM25
         if context.optimized_query:
             must_clauses.append({
                 "multi_match": {
                     "query": context.optimized_query,
-                    "fields": [
-                        "name^4",            # Highest weight for name
-                        "domain^2",
-                        "searchable_text^2", # Enriched field with taxonomy tags
-                        "industry",
-                        "locality",
-                    ],
+                    "fields": self._boosts_to_fields(boosts),
                     "type": "best_fields",
                     "operator": "or",
-                    "fuzziness": "AUTO"
+                    "fuzziness": "AUTO",
                 }
             })
-        
+
         filter_clauses = self._build_filters(context.filters)
-        
         return {
             "query": {
                 "bool": {
@@ -263,77 +289,105 @@ class SemanticSearchStrategy(SearchStrategy):
     """
     Bucket 2: Conceptual Path - Vector (k-NN) search with hybrid scoring.
     Best for: Natural language, synonyms, conceptual queries.
-    Uses msmarco-distilbert embeddings for semantic similarity.
     """
 
-    # Fallback field boosts used when the classifier returns an empty dict.
-    # These mirror the historical hardcoded values so behaviour is unchanged
-    # for queries that don't benefit from dynamic boosting.
-    _DEFAULT_FIELD_BOOSTS: Dict[str, float] = {
-        "name": 2.0,
-        "domain": 1.0,
-        "searchable_text": 2.0,
-        "industry": 1.0,
-        "locality": 1.0,
-    }
+    @property
+    def _DEFAULT_FIELD_BOOSTS(self) -> Dict[str, float]:
+        """Fallback field boosts loaded from search_config.yaml."""
+        return dict(get_search_config().get("field_boosts", {}).get("defaults", {
+            "name": 2.0, "domain": 1.0, "searchable_text": 2.0,
+            "industry": 1.0, "locality": 1.0,
+        }))
+
+    @property
+    def _RRF_K(self) -> int:  # type: ignore[override]
+        return get_search_config().get("rrf", {}).get("k", 60)
 
     def __init__(self, opensearch_service, embedding_service):
         """Initialize with OpenSearch and embedding service"""
         self.opensearch = opensearch_service
         self.embeddings = embedding_service
         self.strategy_type = "semantic"
-    
+
     def search(self, context: SearchContext) -> tuple[List[SearchResult], Dict[str, Any]]:
         """
-        Execute hybrid (BM25 + k-NN) semantic search.
-        Combines lexical and semantic scores using RRF (Reciprocal Rank Fusion).
+        Execute hybrid semantic search using true Reciprocal Rank Fusion (RRF).
+
+        Two independent OpenSearch queries are issued:
+          1. BM25 (lexical) — multi_match with LLM-extracted field boosts
+          2. k-NN (vector)  — cosine similarity using a BGE query embedding
+
+        Results are merged with RRF:
+          rrf_score(doc) = 1/(k + bm25_rank) + 1/(k + knn_rank)
+
+        This avoids the scale-mismatch issue of combining raw BM25/L2 scores
+        in a bool.should clause, and produces significantly better rankings.
         """
         start_time = time.time()
-        
+
         logger.info(
             "semantic_search_started",
             trace_id=context.trace_id,
             query=context.query[:100]
         )
-        
+
         try:
-            # Generate embedding for semantic search
+            # Generate BGE query embedding (with asymmetric retrieval prefix)
             embedding = self.embeddings.embed(context.optimized_query)
-            
-            # Build hybrid query
-            query_body = self._build_hybrid_query(context, embedding)
-            
-            # Execute search
-            response = self.opensearch.search(
-                index="companies",
-                body=query_body,
-                size=context.limit * 2,  # Get more for RRF
-                from_=(context.page - 1) * context.limit
+
+            # Over-fetch for both legs so RRF has enough candidates
+            rrf_cfg = get_search_config().get("rrf", {})
+            fetch_size = max(context.limit * rrf_cfg.get("fetch_multiplier", 4), 100)
+
+            # --- BM25 leg ---
+            bm25_response = self.opensearch.search(
+                index=get_settings().OPENSEARCH_INDEX_NAME,
+                body=self._build_bm25_query(context),
+                size=fetch_size,
+                from_=0,
             )
-            
-            # Process and rank results
-            results = self._process_results(response, context)
-            
+
+            # --- k-NN leg ---
+            knn_response = self.opensearch.search(
+                index=get_settings().OPENSEARCH_INDEX_NAME,
+                body=self._build_knn_query(context, embedding),
+                size=fetch_size,
+                from_=0,
+            )
+
+            # --- RRF merge ---
+            bm25_hits = bm25_response.get("hits", {}).get("hits", [])
+            knn_hits = knn_response.get("hits", {}).get("hits", [])
+            merged_hits = self._rrf_merge(bm25_hits, knn_hits)
+
+            # Paginate after merge
+            page_start = (context.page - 1) * context.limit
+            page_hits = merged_hits[page_start: page_start + context.limit]
+
+            results = self._process_rrf_results(page_hits, context)
+
             execution_time = time.time() - start_time
             effective_boosts = self._resolve_field_boosts(context)
             metadata = {
                 "strategy": self.strategy_type,
-                "total_hits": response.get("hits", {}).get("total", {}).get("value", 0),
+                "total_hits": len(merged_hits),
                 "returned": len(results),
                 "execution_time_ms": int(execution_time * 1000),
                 "embedding_dim": len(embedding) if embedding else 0,
                 "score_range": self._get_score_range(results),
                 "field_boosts_applied": effective_boosts,
+                "bm25_candidates": len(bm25_hits),
+                "knn_candidates": len(knn_hits),
             }
-            
+
             logger.info(
                 "semantic_search_completed",
                 trace_id=context.trace_id,
                 **metadata
             )
-            
-            return results[:context.limit], metadata
-            
+
+            return results, metadata
+
         except Exception as e:
             logger.error(
                 "semantic_search_failed",
@@ -359,34 +413,14 @@ class SemanticSearchStrategy(SearchStrategy):
                 merged[field] = float(boost)
         return merged
 
-    @staticmethod
-    def _boosts_to_fields(boosts: Dict[str, float]) -> List[str]:
-        """Convert a boost dict to the OpenSearch fields list format.
-
-        Fields with a boost of exactly 1.0 are emitted without a suffix so the
-        query stays clean (OpenSearch treats bare field names as ^1).
-        """
-        fields = []
-        for field, boost in boosts.items():
-            if boost == 1.0:
-                fields.append(field)
-            else:
-                fields.append(f"{field}^{boost:g}")
-        return fields
-
-    def _build_hybrid_query(self, context: SearchContext, embedding: List[float]) -> Dict[str, Any]:
-        """Build OpenSearch hybrid query combining BM25 + kNN.
-
-        The multi_match field weights are driven by LLM-extracted field_boosts
-        so that queries about industries, locations, company names, etc. are
-        scored with appropriate emphasis on the most relevant fields.
-        """
+    def _build_bm25_query(self, context: SearchContext) -> Dict[str, Any]:
+        """BM25 leg — multi_match with LLM-extracted field boosts + filters."""
         filter_clauses = self._build_filters(context.filters)
         effective_boosts = self._resolve_field_boosts(context)
         boosted_fields = self._boosts_to_fields(effective_boosts)
 
         bool_query: Dict[str, Any] = {
-            "should": [
+            "must": [
                 {
                     "multi_match": {
                         "query": context.optimized_query,
@@ -394,28 +428,76 @@ class SemanticSearchStrategy(SearchStrategy):
                         "type": "best_fields",
                         "operator": "or",
                     }
-                },
-                {
-                    "knn": {
-                        "vector_embedding": {
-                            "vector": embedding,
-                            "k": 100,
-                        }
-                    }
-                },
-            ],
-            "minimum_should_match": 1,
+                }
+            ]
         }
-
         if filter_clauses:
             bool_query["filter"] = filter_clauses
 
         return {"query": {"bool": bool_query}}
-    
-    def _process_results(self, response: Dict, context: SearchContext) -> List[SearchResult]:
-        """Convert OpenSearch response to SearchResult objects"""
+
+    def _build_knn_query(self, context: SearchContext, embedding: List[float]) -> Dict[str, Any]:
+        """k-NN leg — cosine similarity on the BGE vector field + filters.
+
+        OpenSearch requires `knn` to be the TOP-LEVEL query type — it cannot
+        be nested inside a bool.must clause. Filters are placed INSIDE the knn
+        clause (supported since OpenSearch 2.x) so that filtering is applied
+        at the ANN candidate selection stage for efficiency.
+        """
+        filter_clauses = self._build_filters(context.filters)
+
+        knn_params: Dict[str, Any] = {
+            "vector": embedding,
+            "k": get_search_config().get("rrf", {}).get("knn_k", 100),
+        }
+        if filter_clauses:
+            knn_params["filter"] = {"bool": {"must": filter_clauses}}
+
+        return {"query": {"knn": {"vector_embedding": knn_params}}}
+
+    def _rrf_merge(
+        self,
+        bm25_hits: List[Dict],
+        knn_hits: List[Dict],
+        k: Optional[int] = None,
+    ) -> List[Dict]:
+        """
+        Merge two ranked hit lists using Reciprocal Rank Fusion.
+
+        rrf_score(doc) = sum over lists of 1 / (k + rank_in_list)
+
+        Documents that appear in both lists get contributions from both.
+        Documents that appear in only one list get a contribution from that list.
+        """
+        if k is None:
+            k = self._RRF_K
+        scores: Dict[str, float] = {}
+        # Store the best _source for each doc (prefer knn as it has full source)
+        sources: Dict[str, Dict] = {}
+
+        for rank, hit in enumerate(bm25_hits, start=1):
+            doc_id = hit["_id"]
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+            sources.setdefault(doc_id, hit)
+
+        for rank, hit in enumerate(knn_hits, start=1):
+            doc_id = hit["_id"]
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+            sources.setdefault(doc_id, hit)
+
+        # Sort descending by RRF score and annotate each hit
+        sorted_ids = sorted(scores, key=lambda d: scores[d], reverse=True)
+        merged = []
+        for doc_id in sorted_ids:
+            hit = dict(sources[doc_id])
+            hit["_rrf_score"] = scores[doc_id]
+            merged.append(hit)
+        return merged
+
+    def _process_rrf_results(self, hits: List[Dict], context: SearchContext) -> List[SearchResult]:
+        """Convert RRF-merged hits to SearchResult objects, using _rrf_score as relevance."""
         results = []
-        for hit in response.get("hits", {}).get("hits", []):
+        for hit in hits:
             source = hit.get("_source", {})
             results.append(SearchResult(
                 company_id=source.get("company_id", hit.get("_id")),
@@ -424,10 +506,10 @@ class SemanticSearchStrategy(SearchStrategy):
                 industry=source.get("industry"),
                 country=source.get("country"),
                 locality=source.get("locality"),
-                relevance_score=float(hit.get("_score", 0)),
+                relevance_score=float(hit.get("_rrf_score", hit.get("_score", 0))),
                 search_method=self.strategy_type,
-                ranking_source="hybrid",
-                matching_reason="Semantic match on company name, domain, industry and location",
+                ranking_source="rrf_hybrid",
+                matching_reason="Hybrid semantic + lexical match ranked by Reciprocal Rank Fusion",
                 year_founded=source.get("year_founded"),
                 size_range=source.get("size_range"),
                 current_employee_estimate=source.get("current_employee_estimate"),

@@ -4,93 +4,54 @@ Handles reading CSV data and indexing into OpenSearch.
 """
 from datetime import datetime
 
+import json
 import pandas as pd
-import logging
 import sys
+import yaml
 from pathlib import Path
+from observability import configure_logging, generate_trace_id
 from opensearchpy import OpenSearch, helpers
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Setup structured JSON logging — same format as the backend
+configure_logging()
+import structlog
+logger = structlog.get_logger(__name__)
 # Load environment variables
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 # ---------------------------------------------------------------------------
+# Load pipeline config
+# ---------------------------------------------------------------------------
+_CONFIG_PATH = Path(__file__).parent / "ingest_config.yaml"
+with _CONFIG_PATH.open() as _fh:
+    INGEST_CONFIG: dict = yaml.safe_load(_fh)
+
+# ---------------------------------------------------------------------------
 # Industry taxonomy: maps raw CSV labels → search-friendly synonym tags
 # ---------------------------------------------------------------------------
-INDUSTRY_TAXONOMY: dict[str, list[str]] = {
-    "information technology and services": ["technology", "tech", "IT", "software", "computing", "digital", "cloud"],
-    "computer software": ["software", "tech", "SaaS", "programming", "applications", "technology"],
-    "internet": ["internet", "online", "web", "digital", "e-commerce", "tech"],
-    "financial services": ["finance", "banking", "fintech", "investment", "capital", "financial"],
-    "banking": ["banking", "finance", "financial", "fintech", "credit"],
-    "insurance": ["insurance", "finance", "risk", "financial services"],
-    "hospital & health care": ["healthcare", "health", "medical", "clinical", "hospital"],
-    "medical devices": ["medtech", "medical devices", "health", "healthcare"],
-    "pharmaceuticals": ["pharma", "drugs", "biotech", "life sciences", "healthcare"],
-    "biotechnology": ["biotech", "life sciences", "pharma", "health", "medical research"],
-    "oil & energy": ["energy", "oil", "gas", "petroleum", "utilities"],
-    "renewables & environment": ["clean energy", "green", "sustainability", "solar", "wind", "environmental", "energy"],
-    "utilities": ["utilities", "energy", "power", "water", "infrastructure"],
-    "telecommunications": ["telecom", "wireless", "communications", "networking", "broadband"],
-    "retail": ["retail", "e-commerce", "consumer goods", "shopping"],
-    "consumer goods": ["consumer goods", "FMCG", "retail", "products"],
-    "real estate": ["real estate", "property", "realty", "construction"],
-    "construction": ["construction", "engineering", "infrastructure", "real estate"],
-    "education management": ["education", "edtech", "learning", "university", "training"],
-    "e-learning": ["edtech", "online learning", "education", "training"],
-    "management consulting": ["consulting", "advisory", "professional services", "strategy"],
-    "staffing and recruiting": ["staffing", "recruiting", "HR", "talent", "employment"],
-    "human resources": ["HR", "human resources", "people", "talent"],
-    "marketing and advertising": ["marketing", "advertising", "digital marketing", "media"],
-    "media production": ["media", "content", "entertainment", "publishing"],
-    "entertainment": ["entertainment", "media", "gaming", "content"],
-    "automotive": ["automotive", "cars", "vehicles", "transportation"],
-    "transportation/trucking/railroad": ["transportation", "logistics", "trucking", "freight"],
-    "logistics and supply chain": ["logistics", "supply chain", "warehousing", "shipping", "transportation"],
-    "aviation & aerospace": ["aerospace", "aviation", "defense", "aircraft"],
-    "defense & space": ["defense", "aerospace", "military", "government"],
-    "food & beverages": ["food", "beverages", "FMCG", "consumer goods"],
-    "restaurants": ["food", "restaurants", "hospitality", "dining"],
-    "hospitality": ["hospitality", "hotels", "travel", "tourism"],
-    "leisure, travel & tourism": ["travel", "tourism", "hospitality", "leisure"],
-    "architecture & planning": ["architecture", "design", "planning", "engineering"],
-    "civil engineering": ["civil engineering", "construction", "infrastructure"],
-    "mechanical or industrial engineering": ["engineering", "manufacturing", "industrial"],
-    "electrical/electronic manufacturing": ["electronics", "manufacturing", "hardware", "tech"],
-    "semiconductors": ["semiconductors", "chips", "hardware", "tech", "electronics"],
-    "hardware": ["hardware", "electronics", "tech", "devices"],
-    "nanotechnology": ["nanotech", "science", "tech", "research"],
-    "research": ["research", "science", "R&D"],
-    "government administration": ["government", "public sector", "administration"],
-    "non-profit organization management": ["non-profit", "NGO", "charity"],
-    "law practice": ["legal", "law", "legal services", "professional services"],
-    "accounting": ["accounting", "finance", "audit", "professional services"],
-    "venture capital & private equity": ["venture capital", "VC", "private equity", "investment", "finance"],
-    "investment management": ["investment", "asset management", "finance", "wealth"],
-    "security and investigations": ["security", "cybersecurity", "safety"],
-    "computer & network security": ["cybersecurity", "security", "tech", "IT"],
-    "information services": ["data", "analytics", "information", "tech"],
-    "market research": ["market research", "analytics", "data", "insights"],
-    "environmental services": ["environment", "sustainability", "green", "ecology"],
-    "mining & metals": ["mining", "metals", "resources", "materials"],
-    "chemicals": ["chemicals", "materials", "industrial", "science"],
-    "textiles": ["textiles", "fashion", "apparel", "manufacturing"],
-    "apparel & fashion": ["fashion", "apparel", "retail", "clothing"],
-    "sporting goods": ["sports", "fitness", "retail", "consumer goods"],
-    "health, wellness and fitness": ["wellness", "fitness", "health", "sports"],
-}
+_TAXONOMY_PATH = Path(__file__).parent / "industry_taxonomy.json"
+with _TAXONOMY_PATH.open() as _fh:
+    INDUSTRY_TAXONOMY: dict[str, list[str]] = json.load(_fh)
 
 
 def get_industry_tags(industry: str) -> list[str]:
     """Return synonym tags for a given industry label."""
     return INDUSTRY_TAXONOMY.get(industry.lower().strip(), [])
+
+
+# ---------------------------------------------------------------------------
+# Country taxonomy: maps country names → regional/alias tags for enriched search
+# ---------------------------------------------------------------------------
+_COUNTRY_TAXONOMY_PATH = Path(__file__).parent / "country_taxonomy.json"
+with _COUNTRY_TAXONOMY_PATH.open() as _fh:
+    COUNTRY_TAXONOMY: dict[str, list[str]] = json.load(_fh)
+
+
+def get_country_tags(country: str) -> list[str]:
+    """Return regional/alias tags for a given country label."""
+    return COUNTRY_TAXONOMY.get(country.lower().strip(), [])
 
 
 def parse_locality(locality: str) -> tuple[str, str]:
@@ -120,20 +81,23 @@ class DataIngestionPipeline:
                 verify_certs=False,
                 timeout=30
             )
-            logger.info(f"Connected to OpenSearch at {opensearch_host}:{opensearch_port}")
+            logger.info("opensearch_connected", host=opensearch_host, port=opensearch_port)
         except Exception as e:
-            logger.error(f"Failed to connect to OpenSearch: {e}")
+            logger.error("opensearch_connection_failed", error=str(e))
             raise
         
-        self.index_name = "companies-new"
-        
-        # Initialize embedding model (768-dim model optimized for search)
+        self.index_name = INGEST_CONFIG["index_name"]
+        self.batch_trace_id = generate_trace_id()
+        logger.info("pipeline_initialised", index=self.index_name, batch_trace_id=self.batch_trace_id)
+
+        # Initialize embedding model
+        _model_name = INGEST_CONFIG["embedding"]["model"]
         try:
-            logger.info("Loading SentenceTransformer model...")
-            self.embedding_model = SentenceTransformer('./msmarco-distilbert-base-tas-b')
-            logger.info("Embedding model loaded successfully")
+            logger.info("loading_embedding_model", model=_model_name)
+            self.embedding_model = SentenceTransformer(_model_name)
+            logger.info("embedding_model_loaded")
         except Exception as e:
-            logger.error(f"Failed to load embedding model: {e}")
+            logger.error("embedding_model_load_failed", error=str(e))
             raise
     
     def create_index(self):
@@ -141,87 +105,15 @@ class DataIngestionPipeline:
         try:
             # Check if index exists
             if self.client.indices.exists(self.index_name):
-                logger.info(f"Index '{self.index_name}' already exists. Deleting and recreating...")
+                logger.info("index_exists_recreating", index=self.index_name)
                 self.client.indices.delete(index=self.index_name)
         except Exception as e:
-            logger.error(f"Error checking/deleting existing index: {e}")
+            logger.error("index_check_failed", error=str(e))
             raise
         
-        index_body = {
-            "settings": {
-                "index": {
-                    "number_of_shards": 2, 
-                    "number_of_replicas": 0, # 0 during ingestion for speed; change to 1 after
-                    "knn": True,
-                    "refresh_interval": "60s" # Minimizes disk I/O during heavy load
-                },
-                "analysis": {
-                    "normalizer": {
-                        "lowercase_normalizer": {
-                            "type": "custom",
-                            "filter": ["lowercase"]
-                        }
-                    },
-                    "analyzer": {
-                        "edge_ngram_analyzer": {
-                            "type": "custom",
-                            "tokenizer": "edge_ngram_tokenizer",
-                            "filter": ["lowercase"]
-                        }
-                    },
-                    "tokenizer": {
-                        "edge_ngram_tokenizer": {
-                            "type": "edge_ngram",
-                            "min_gram": 1,
-                            "max_gram": 20,
-                            "token_chars": ["letter", "digit"]
-                        }
-                    }
-                }
-            },
-            "mappings": {
-                "_source": {"excludes": ["vector_embedding"]},
-                "properties": {
-                    "company_id": {"type": "keyword"},
-                    "name": {
-                        "type": "text",
-                        "fields": {
-                            "keyword": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                            "edge_ngram": {"type": "text", "analyzer": "edge_ngram_analyzer"}
-                        }
-                    },
-                    "domain": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                    "year_founded": {"type": "integer"},
-                    "industry": {
-                        "type": "text",
-                        "fields": { "keyword": {"type": "keyword", "normalizer": "lowercase_normalizer"} }
-                    },
-                    "country": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                    "locality": {"type": "text"},
-                    "indexed_at": {"type": "date"},
-                    "current_employee_estimate": {"type": "long"},
-                    "total_employee_estimate": {"type": "long"},
-                    "size_range": {"type": "keyword"},
-                    "city": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                    "state": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                    "industry_tags": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                    "searchable_text": {"type": "text", "analyzer": "standard"},
-                    "vector_embedding": {
-                        "type": "knn_vector",
-                        "dimension": 768,
-                        "method": {
-                            "name": "hnsw",
-                            "space_type": "l2",
-                            "engine": "faiss",
-                            "parameters": {
-                                "m": 16,
-                                "ef_construction": 128
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        _mapping_path = Path(__file__).parent / "index_mapping.json"
+        with _mapping_path.open() as _fh:
+            index_body = json.load(_fh)
         
         # Create index
         try:
@@ -229,35 +121,40 @@ class DataIngestionPipeline:
                 index=self.index_name,
                 body=index_body
             )
-            logger.info(f"Index '{self.index_name}' created successfully")
+            logger.info("index_created", index=self.index_name)
         except Exception as e:
-            logger.error(f"Failed to create index: {e}")
+            logger.error("index_creation_failed", error=str(e))
             raise
     
-    def data_generator(self, file_path: str, chunk_size: int = 10000, embedding_batch_size: int = 512):
-        """Streaming generator to process 7M rows in chunks with batch embedding generation."""
+    def data_generator(self, file_path: str,
+                        chunk_size: int = None,
+                        embedding_batch_size: int = None):
+        """Streaming generator to process rows in chunks with batch embedding generation."""
+        chunk_size = chunk_size or INGEST_CONFIG.get("chunk_size", 10000)
+        embedding_batch_size = embedding_batch_size or INGEST_CONFIG.get("embedding_batch_size", 512)
+        emb_dim = INGEST_CONFIG.get("embedding", {}).get("dimension", 768)
         # Validate file exists
         if not Path(file_path).exists():
-            logger.error(f"CSV file not found: {file_path}")
+            logger.error("csv_not_found", path=file_path)
             raise FileNotFoundError(f"CSV file not found: {file_path}")
         
-        logger.info(f"Starting to read CSV: {file_path}")
+        logger.info("csv_read_started", path=file_path)
         
         try:
             reader = pd.read_csv(file_path, chunksize=chunk_size)
         except Exception as e:
-            logger.error(f"Failed to open CSV file {file_path}: {e}")
+            logger.error("csv_open_failed", path=file_path, error=str(e))
             raise
         
         for chunk in reader:
             try:
                 # --- CLEANING LOGIC ---
-                chunk['year founded'] = pd.to_numeric(chunk['year founded'], errors='coerce').fillna(0).astype(int)
+                chunk['year_founded'] = pd.to_numeric(chunk['year_founded'], errors='coerce').fillna(0).astype(int)
                 chunk['industry'] = chunk['industry'].fillna("Unknown").str.strip()
                 chunk['country'] = chunk['country'].fillna("Unknown").str.strip()
                 chunk['locality'] = chunk['locality'].fillna('').str.strip()
             except Exception as e:
-                logger.error(f"Error cleaning chunk: {e}")
+                logger.error("chunk_clean_failed", error=str(e))
                 continue  # Skip this chunk and continue with next
             
             records = chunk.to_dict('records')
@@ -272,39 +169,46 @@ class DataIngestionPipeline:
                 locality = row.get('locality', '')
                 city, state = parse_locality(locality)
                 tags = get_industry_tags(industry)
-                size = row.get('size range', '')
-                parsed.append((industry, locality, city, state, tags, size))
+                ctags = get_country_tags(row.get('country', ''))
+                size = row.get('size_range', '')
+                parsed.append((industry, locality, city, state, tags, size, ctags))
 
             # Process embeddings in batches for efficiency
             for i in range(0, len(records), embedding_batch_size):
                 batch_records = records[i:i + embedding_batch_size]
                 batch_parsed = parsed[i:i + embedding_batch_size]
-                logger.info(f"Processing batch {i // embedding_batch_size + 1} with {len(batch_records)} records...")
+                logger.info("embedding_batch_processing",
+                            batch_num=i // embedding_batch_size + 1,
+                            batch_size=len(batch_records),
+                            batch_trace_id=self.batch_trace_id)
 
-                # Build embedding texts using pre-computed values — no redundant calls
+                # Build embedding texts — BGE documents use plain text, no prefix.
+                # Format: "<name>. <industry> <tags>. <size>. <location> <country_tags>".
                 texts = [
-                    f"search_document: company: {row.get('name', '')}. "
+                    f"company: {row.get('name', '')}. "
                     f"industry: {industry} {' '.join(tags)}. "
                     f"size: {size}. "
-                    f"location: {locality}, {state + ', ' if state else ''}{row.get('country', 'Unknown')}"
-                    for row, (industry, locality, _, state, tags, size) in zip(batch_records, batch_parsed)
+                    f"location: {locality}, {state + ', ' if state else ''}{row.get('country', 'Unknown')} {' '.join(ctags)}"
+                    for row, (industry, locality, _, state, tags, size, ctags) in zip(batch_records, batch_parsed)
                 ]
                 try:
-                    embeddings = self.embedding_model.encode(texts, batch_size=64, show_progress_bar=False).tolist()
+                    embeddings = self.embedding_model.encode(
+                        texts, batch_size=64, show_progress_bar=False, normalize_embeddings=True
+                    ).tolist()
                 except Exception as e:
-                    logger.error(f"Failed to generate batch embeddings: {e}")
-                    embeddings = [[0.0] * 768 for _ in batch_records]
+                    logger.error("embedding_batch_failed", error=str(e))
+                    embeddings = [[0.0] * emb_dim for _ in batch_records]
 
-                for row, (industry, locality, city, state, tags, size), vector_embedding in zip(batch_records, batch_parsed, embeddings):
+                for row, (industry, locality, city, state, tags, size, ctags), vector_embedding in zip(batch_records, batch_parsed, embeddings):
                     # Safe field extraction with defaults
                     company_id = str(row.get('Unnamed: 0', ''))
-                    year_founded = int(row.get('year founded', 0))
-                    current_employees = int(row.get('current employee estimate', 0))
-                    total_employees = int(row.get('total employee estimate', 0))
+                    year_founded = int(row.get('year_founded', 0))
+                    current_employees = int(row.get('current_employee_estimate', 0))
+                    total_employees = int(row.get('total_employee_estimate', 0))
 
                     searchable_text = " ".join(filter(None, [
                         row.get('name', ''), industry, " ".join(tags),
-                        locality, city, state, row.get('country', ''), size
+                        locality, city, state, row.get('country', ''), size, " ".join(ctags)
                     ]))
                     yield {
                         "_index": self.index_name,
@@ -318,6 +222,7 @@ class DataIngestionPipeline:
                             "industry_tags": tags,
                             "size_range": size,
                             "country": row.get('country', 'Unknown'),
+                            "country_tags": ctags,
                             "locality": locality,
                             "city": city,
                             "state": state,
@@ -325,23 +230,22 @@ class DataIngestionPipeline:
                             "current_employee_estimate": current_employees,
                             "total_employee_estimate": total_employees,
                             "vector_embedding": vector_embedding,
-                            "indexed_at": indexed_at
+                            "indexed_at": indexed_at,
+                            "ingestion_batch_id": self.batch_trace_id,
                         }
                     }
 
-    def ingest_from_csv(self, csv_path: str = None, chunk_size: int = 50000, bulk_chunk_size: int = 500):
-        """Start ingestion using parallel bulk API for CSV data.
-        
-        chunk_size: rows per pandas read chunk (controls RAM usage).
-        bulk_chunk_size: documents per OpenSearch bulk request. Keep low (~500)
-                         because each doc carries a 768-float vector (~3 KB),
-                         so 500 docs ≈ 1.5 MB per request — well within limits.
-        """
+    def ingest_from_csv(self, csv_path: str = None,
+                         chunk_size: int = None,
+                         bulk_chunk_size: int = None):
+        """Start ingestion using parallel bulk API for CSV data."""
+        chunk_size = chunk_size or INGEST_CONFIG.get("chunk_size", 10000)
+        bulk_chunk_size = bulk_chunk_size or INGEST_CONFIG.get("bulk_chunk_size", 500)
         if not csv_path:
             raise ValueError("csv_path is required for ingestion")
         
         try:
-            logger.info("Starting ingestion...")
+            logger.info("ingestion_started", batch_trace_id=self.batch_trace_id)
             success_count = 0
             failed_count = 0
             # queue_size > thread_count lets producers pre-fill the queue so
@@ -357,13 +261,15 @@ class DataIngestionPipeline:
                 if success:
                     success_count += 1
                     if success_count % 5000 == 0:
-                        logger.info(f"Indexed {success_count} documents...")
+                        logger.info("ingestion_progress", indexed=success_count,
+                                    batch_trace_id=self.batch_trace_id)
                 else:
                     failed_count += 1
-                    logger.error(f"Failure: {info}")
-            logger.info(f"Ingestion complete. Total indexed: {success_count}, Failed: {failed_count}")
+                    logger.error("document_index_failed", info=info)
+            logger.info("ingestion_complete", indexed=success_count, failed=failed_count,
+                        batch_trace_id=self.batch_trace_id)
         except Exception as e:
-            logger.error(f"CSV ingestion failed: {e}")
+            logger.error("csv_ingestion_failed", error=str(e))
             raise
         finally:
             self._finalize_index()
@@ -371,7 +277,7 @@ class DataIngestionPipeline:
     def _finalize_index(self):
         """Reset ingestion-time settings and merge segments for optimal knn performance."""
         try:
-            logger.info("Resetting index settings post-ingestion...")
+            logger.info("index_finalizing", index=self.index_name)
             self.client.indices.put_settings(
                 index=self.index_name,
                 body={"index": {"refresh_interval": "1s", "number_of_replicas": 1}}
@@ -379,11 +285,11 @@ class DataIngestionPipeline:
             self.client.indices.refresh(index=self.index_name)
             # Force-merge to reduce HNSW segment count — critical for knn recall and query speed.
             # max_num_segments=5 balances merge time vs. query performance.
-            logger.info("Running forcemerge (this may take several minutes for large indices)...")
+            logger.info("index_forcemerge_started", index=self.index_name)
             self.client.indices.forcemerge(index=self.index_name, max_num_segments=5)
-            logger.info("Index finalized.")
+            logger.info("index_finalized", index=self.index_name)
         except Exception as e:
-            logger.warning(f"Post-ingestion finalization failed (non-fatal): {e}")
+            logger.warning("index_finalization_failed", error=str(e))
 
 
     
@@ -405,15 +311,16 @@ class DataIngestionPipeline:
                 locality = str(row.get("locality") or "")
                 city, state = parse_locality(locality)
                 tags = get_industry_tags(industry)
+                ctags = get_country_tags(row.get("country", ""))
                 size = row.get("size_range", "")
-                parsed.append((industry, locality, city, state, tags, size))
+                parsed.append((industry, locality, city, state, tags, size, ctags))
 
             texts = [
                 f"search_document: company: {row.get('name', '')}. "
                 f"industry: {industry} {' '.join(tags)}. "
                 f"size: {size}. "
-                f"location: {locality}, {state + ', ' if state else ''}{row.get('country', 'Unknown')}"
-                for row, (industry, locality, _, state, tags, size) in zip(batch_records, parsed)
+                f"location: {locality}, {state + ', ' if state else ''}{row.get('country', 'Unknown')} {' '.join(ctags)}"
+                for row, (industry, locality, _, state, tags, size, ctags) in zip(batch_records, parsed)
             ]
             try:
                 embeddings = self.embedding_model.encode(texts, batch_size=64, show_progress_bar=False).tolist()
@@ -421,12 +328,12 @@ class DataIngestionPipeline:
                 logger.error(f"Failed to generate batch embeddings: {e}")
                 embeddings = [[0.0] * 768 for _ in batch_records]
 
-            for idx, (row, (industry, locality, city, state, tags, size), vector_embedding) in enumerate(
+            for idx, (row, (industry, locality, city, state, tags, size, ctags), vector_embedding) in enumerate(
                 zip(batch_records, parsed, embeddings)
             ):
                 searchable_text = " ".join(filter(None, [
                     row.get("name", ""), industry, " ".join(tags),
-                    locality, city, state, row.get("country", ""), size
+                    locality, city, state, row.get("country", ""), size, " ".join(ctags)
                 ]))
                 yield {
                     "_index": self.index_name,
@@ -439,6 +346,7 @@ class DataIngestionPipeline:
                         "industry_tags": tags,
                         "size_range": size,
                         "country": row.get("country", ""),
+                        "country_tags": ctags,
                         "locality": locality,
                         "city": city,
                         "state": state,
@@ -458,7 +366,7 @@ class DataIngestionPipeline:
         bulk_chunk_size: docs per OpenSearch bulk HTTP request.
         """
         total_records = len(df)
-        logger.info(f"Starting ingestion of {total_records} records...")
+        logger.info("df_ingestion_started", total_records=total_records)
         success_count = 0
         failed_count = 0
         for success, info in helpers.parallel_bulk(
@@ -472,16 +380,16 @@ class DataIngestionPipeline:
             if success:
                 success_count += 1
                 if success_count % 5000 == 0:
-                    logger.info(f"Indexed {success_count}/{total_records} documents...")
+                        logger.info("df_ingestion_progress", indexed=success_count, total=total_records)
             else:
                 failed_count += 1
-                logger.error(f"Failure: {info}")
-        logger.info(f"Ingestion complete. Total indexed: {success_count}, Failed: {failed_count}")
+                logger.error("document_index_failed", info=str(info))
+        logger.info("df_ingestion_complete", indexed=success_count, failed=failed_count)
     
 
     def load_sample_data(self, sample_size=10000) -> pd.DataFrame:
         """Load sample data (create synthetic data for demo)"""
-        logger.info(f"Generating sample data with {sample_size} companies...")
+        logger.info("sample_data_generating", sample_size=sample_size)
         
         industries = [
             "Information Technology and Services",
@@ -530,11 +438,11 @@ class DataIngestionPipeline:
     def ingest_sample_data(self, sample_size: int = 10000):
         """Ingest sample data"""
         try:
-            logger.info(f"Loading sample data ({sample_size} companies)...")
+            logger.info("sample_data_loading", sample_size=sample_size)
             df = self.load_sample_data(sample_size)
             self.start_ingestion_from_dataframe(df, batch_size=1000)
         except Exception as e:
-            logger.error(f"Sample data ingestion failed: {e}")
+            logger.error("sample_ingestion_failed", error=str(e))
             raise
 
     def get_index_stats(self):
@@ -544,11 +452,12 @@ class DataIngestionPipeline:
             doc_count = stats["indices"][self.index_name]["primaries"]["docs"]["count"]
             size_bytes = stats["indices"][self.index_name]["primaries"]["store"]["size_in_bytes"]
             
-            logger.info(f"Index stats: {doc_count} documents, {size_bytes / 1024 / 1024:.2f} MB")
+            logger.info("index_stats", documents=doc_count,
+                        size_mb=round(size_bytes / 1024 / 1024, 2))
             return {"documents": doc_count, "size_mb": size_bytes / 1024 / 1024}
             
         except Exception as e:
-            logger.error(f"Failed to get stats: {e}")
+            logger.error("index_stats_failed", error=str(e))
             return {}
 
 
@@ -573,28 +482,30 @@ def main():
                 opensearch_port=args.port
             )
         except Exception as e:
-            logger.error(f"Failed to initialize pipeline: {e}")
+            logger.error("pipeline_init_failed", error=str(e))
             sys.exit(1)
         
-        # Create or reset index
+        # Always ensure the index exists with the correct settings.
+        # --reset (or first run) will delete and recreate it; without --reset
+        # it is only created if it does not already exist.
         try:
-            if args.reset:
-                logger.info("Creating index...")
+            if args.reset or not pipeline.client.indices.exists(pipeline.index_name):
+                logger.info("creating_index")
                 pipeline.create_index()
         except Exception as e:
-            logger.error(f"Failed to create index: {e}")
+            logger.error("index_create_failed", error=str(e))
             sys.exit(1)
         
         # Ingest data
         try:
             if args.csv:
-                logger.info(f"Ingesting from CSV: {args.csv}")
+                logger.info("csv_ingestion_starting", csv=args.csv)
                 pipeline.ingest_from_csv(csv_path=args.csv)
             else:
-                logger.info(f"Ingesting sample data ({args.sample} records)")
+                logger.info("sample_ingestion_starting", sample_size=args.sample)
                 pipeline.ingest_sample_data(args.sample)
         except Exception as e:
-            logger.error(f"Ingestion failed: {e}")
+            logger.error("ingestion_failed", error=str(e))
             sys.exit(1)
         
         # Show stats

@@ -26,8 +26,7 @@ export default function App() {
   /** Convert internal FiltersState to the UserFilters shape the API expects. */
   const toApiFilters = (f: FiltersState): UserFilters => {
     const out: UserFilters = {};
-    // Send only the first selected value for single-value fields
-    if (f.industries.length > 0) out.industry = f.industries[0];
+    if (f.industries.length > 0) out.industries = f.industries;
     if (f.sizeRanges.length > 0) out.size_range = f.sizeRanges[0];
     if (f.country) out.country = f.country;
     if (f.state) out.state = f.state;

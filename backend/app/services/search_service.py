@@ -1,22 +1,17 @@
 """
-Core search service orchestrating all search operations.
-Coordinates OpenSearch, LLM, caching, and result processing.
+Core search service - structured filter-based company search (basic_search).
+Semantic and agentic search are handled by the orchestrator via search strategies.
 """
 import structlog
 import time
 from functools import lru_cache
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 from app.services.opensearch_service import get_opensearch_service
-from app.services.llm_service import get_llm_service
-from app.services.embedding_service import get_embedding_service
 from app.models.search import (
     BasicSearchRequest, BasicSearchResponse, CompanySearchResult,
-    IntelligentSearchRequest, IntelligentSearchResponse,
-    SemanticSearchRequest, CompanySearchResult as CompanySearchResult,
-    QueryUnderstanding, SearchFacets, FacetValue, Company
+    SearchFacets, FacetValue, Company
 )
 from app.config import get_settings
-import json
 
 logger = structlog.get_logger(__name__)
 
@@ -25,11 +20,8 @@ class SearchService:
     """Main search service"""
     
     def __init__(self):
-        """Initialize search service"""
         self.settings = get_settings()
         self.opensearch = get_opensearch_service()
-        self.llm = get_llm_service()
-        self.embeddings = get_embedding_service()
         self.index_name = self.settings.OPENSEARCH_INDEX_NAME
     
     # ========================================================================
@@ -259,165 +251,6 @@ class SearchService:
             ]
         )
     
-    # ========================================================================
-    # Intelligent Search with LLM
-    # ========================================================================
-    
-    def intelligent_search(self, request: IntelligentSearchRequest) -> IntelligentSearchResponse:
-        """
-        Intelligent search using LLM for query understanding.
-        Extracts entities and applies smart filtering.
-        """
-        start_time = time.time()
-        
-        try:
-            # Step 1: Classify query using LLM
-            query_understanding = self._classify_and_understand_query(request.query)
-            
-            # Step 2: Build search request from understanding
-            search_request = self._build_search_request_from_understanding(
-                query_understanding,
-                request
-            )
-            
-            # Step 3: Execute search
-            search_response = self.basic_search(search_request)
-            
-            # Step 4: Enhance results with explanations
-            results = self._enhance_results_with_explanations(
-                search_response.results,
-                request.query,
-                query_understanding
-            )
-            
-            search_time_ms = int((time.time() - start_time) * 1000)
-            
-            logger.info("intelligent_search_completed",
-                       intent=query_understanding.intent,
-                       results=len(results),
-                       time_ms=search_time_ms)
-            
-            return IntelligentSearchResponse(
-                query_understanding=query_understanding,
-                results=results[:request.max_results],
-                search_time_ms=search_time_ms,
-                query_classified=True,
-                facets=search_response.facets
-            )
-            
-        except Exception as e:
-            logger.error("intelligent_search_failed", error=str(e))
-            raise
-    
-    def _classify_and_understand_query(self, query: str) -> QueryUnderstanding:
-        """Use LLM to understand and classify query"""
-        try:
-            classification = self.llm.classify_query(query)
-            
-            return QueryUnderstanding(
-                intent=classification.get("intent", "filtered_search"),
-                entities=classification.get("entities", {}),
-                confidence=classification.get("confidence", 0.5)
-            )
-        except Exception as e:
-            logger.error("query_understanding_failed", error=str(e))
-            # Fallback to simple parsing
-            return QueryUnderstanding(
-                intent="filtered_search",
-                entities={"keywords": [query]},
-                confidence=0.3
-            )
-    
-    def _build_search_request_from_understanding(
-        self,
-        understanding: QueryUnderstanding,
-        original_request: IntelligentSearchRequest
-    ) -> BasicSearchRequest:
-        """Build structured search request from LLM understanding"""
-        entities = understanding.entities
-        
-        return BasicSearchRequest(
-            q=entities.get("keywords", [""])[0] if entities.get("keywords") else "",
-            industry=entities.get("industries", None),
-            country=entities.get("locations", [None])[0] if entities.get("locations") else None,
-            year_from=entities.get("year_range", [None, None])[0] if entities.get("year_range") else None,
-            year_to=entities.get("year_range", [None, None])[1] if entities.get("year_range") else None,
-            limit=min(original_request.max_results, 100)
-        )
-    
-    def _enhance_results_with_explanations(
-        self,
-        results: List[CompanySearchResult],
-        query: str,
-        understanding: QueryUnderstanding
-    ) -> List[CompanySearchResult]:
-        """Add semantic explanations to results"""
-        if not self.settings.ENABLE_SEMANTIC_SEARCH:
-            return results
-        
-        enhanced = []
-        for result in results[:10]:  # Limit to top 10 for efficiency
-            try:
-                explanation = self.llm.generate_semantic_explanation(
-                    result.company.name,
-                    result.company.industry,
-                    query
-                )
-                result.matching_reason = explanation
-            except Exception as e:
-                logger.debug("explanation_generation_failed", error=str(e))
-                result.matching_reason = None
-            
-            enhanced.append(result)
-        
-        return enhanced + results[10:]  # Append remaining results
-    
-    # ========================================================================
-    # Semantic Vector Search
-    # ========================================================================
-    
-    def semantic_search(self, request: SemanticSearchRequest) -> List[CompanySearchResult]:
-        """
-        Semantic search using vector embeddings.
-        Finds companies semantically similar to the query.
-        """
-        start_time = time.time()
-        
-        try:
-            # Generate embedding using local SentenceTransformer (msmarco-distilbert-base-tas-b)
-            query_embedding = self.embeddings.embed(request.query)
-            
-            # Vector search in OpenSearch
-            vector_results = self.opensearch.vector_search(
-                index=self.index_name,
-                vector_field="vector_embedding",
-                query_vector=query_embedding,
-                k=request.top_k,
-                min_score=request.similarity_threshold
-            )
-            
-            # Convert to CompanySearchResult
-            results = []
-            for result in vector_results:
-                company = Company(**result["source"])
-                results.append(CompanySearchResult(
-                    company=company,
-                    relevance_score=result["score"],
-                    matching_reason=f"Semantically similar to: {request.query}"
-                ))
-            
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            logger.info("semantic_search_completed",
-                       results=len(results),
-                       time_ms=elapsed_ms)
-            
-            return results
-            
-        except Exception as e:
-            logger.error("semantic_search_failed", error=str(e))
-            return []
-
-
 @lru_cache(maxsize=1)
 def get_search_service() -> SearchService:
     """Get or create search service singleton"""

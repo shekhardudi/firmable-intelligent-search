@@ -17,23 +17,11 @@ import uuid
 from app.config import get_settings
 from app.api import routes
 
-# Configure structured logging
-structlog.configure(
-    processors=[
-        structlog.stdlib.filter_by_level,
-        structlog.stdlib.add_logger_name,
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.PositionalArgumentsFormatter(),
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.UnicodeDecoder(),
-        structlog.processors.JSONRenderer()
-    ],
-    context_class=dict,
-    logger_factory=structlog.stdlib.LoggerFactory(),
-    cache_logger_on_first_use=True,
-)
+# ---------------------------------------------------------------------------
+# Logging — configured at import time so every module sees JSON output.
+# ---------------------------------------------------------------------------
+from app.observability import configure_logging
+configure_logging()
 
 logger = structlog.get_logger(__name__)
 
@@ -54,7 +42,7 @@ async def lifespan(app: FastAPI):
         version="2.0.0",
         architecture="orchestrator-based"
     )
-    
+
     settings = get_settings()
     logger.info(
         "configuration_loaded",
@@ -63,8 +51,13 @@ async def lifespan(app: FastAPI):
         query_classification_enabled=settings.ENABLE_QUERY_CLASSIFICATION,
         semantic_search_enabled=settings.ENABLE_SEMANTIC_SEARCH,
         agentic_search_enabled=settings.ENABLE_AGENTIC_SEARCH,
-        langsmith_enabled=settings.ENABLE_LANGSMITH
     )
+
+    # Configure OTel tracing + metrics (non-fatal on any import/config error)
+    from app.observability import configure_tracing, configure_metrics, instrument_fastapi
+    configure_tracing(settings.OTEL_SERVICE_NAME, settings.OTLP_ENDPOINT)
+    configure_metrics(settings.OTEL_SERVICE_NAME, settings.OTLP_ENDPOINT)
+    instrument_fastapi(app)
     
     # Initialize and test OpenSearch connection
     try:
@@ -106,18 +99,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("search_orchestrator_initialization_failed", error=str(e))
     
-    # Initialize Observability Service
-    try:
-        from app.services.observability import get_observability_service
-        observability = get_observability_service()
-        logger.info(
-            "observability_service_initialized",
-            tracing_enabled=settings.ENABLE_TRACING,
-            langsmith_enabled=settings.ENABLE_LANGSMITH
-        )
-    except Exception as e:
-        logger.warning("observability_service_initialization_failed", error=str(e))
-    
     logger.info("startup_complete", timestamp=time.time())
     
     yield
@@ -152,7 +133,7 @@ def get_application() -> FastAPI:
         - **Agentic**: External tools (news, funding, events)
         
         **3. Observability** 📊
-        - Built-in tracing with LangSmith integration
+        - OpenTelemetry tracing and metrics (OTLP → OTel Collector → Jaeger/Prometheus)
         - Response headers expose search logic and confidence scores
         - Detailed execution metadata for every query
         

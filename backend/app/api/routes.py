@@ -10,8 +10,10 @@ import structlog
 from pydantic import BaseModel, Field
 
 from app.services.orchestrator import get_search_orchestrator
-from app.services.observability import get_observability_service
-
+from app.models.search import BasicSearchRequest, BasicSearchResponse
+from app.observability import log_search_execution
+import time as _time
+from app.observability.metrics import get_search_metrics
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/api/search", tags=["search"])
@@ -29,7 +31,7 @@ class UserFilters(BaseModel):
     country: Optional[str] = Field(None, description="Filter by country (e.g. 'United States')")
     state: Optional[str] = Field(None, description="Filter by state/province (e.g. 'California')")
     city: Optional[str] = Field(None, description="Filter by city (e.g. 'San Francisco')")
-    industry: Optional[str] = Field(None, description="Filter by industry (e.g. 'technology', 'healthcare')")
+    industries: Optional[List[str]] = Field(None, description="Filter by industries (multi-select, exact names)")
     year_from: Optional[int] = Field(None, ge=1800, le=2100, description="Founded from year")
     year_to: Optional[int] = Field(None, ge=1800, le=2100, description="Founded to year")
     size_range: Optional[str] = Field(None, description="Company size range (e.g. '51-200')")
@@ -102,7 +104,7 @@ class SearchResponse(BaseModel):
 async def intelligent_search(
     request: SearchRequest,
     trace_id: Optional[str] = Header(None, description="Optional trace ID for correlation"),
-    response: Response = None,
+    response: Optional[Response] = None,
 ):
     """
     Intelligent search with automatic query classification and strategy routing.
@@ -137,7 +139,7 @@ async def intelligent_search(
     **Semantic query** (Natural language, conceptual):
     ```json
     {
-        "query": "sustainable energy companies in Europe",
+        "query": "Tech companies in France",
         "limit": 20
     }
     ```
@@ -151,20 +153,31 @@ async def intelligent_search(
     ```
     """
     try:
-        # Initialize orchestrator and observability
+        _metrics = get_search_metrics()
+        # Initialize orchestrator
         orchestrator = get_search_orchestrator()
-        observability = get_observability_service()
-        
-        # Execute search through orchestrator (offloaded to thread to avoid blocking the event loop)
-        orch_response = await asyncio.to_thread(
-            orchestrator.search,
-            request.query,
-            request.limit,
-            request.page,
-            trace_id,
-            request.include_reasoning,
-            request.filters.model_dump(exclude_none=True) if request.filters else {}
-        )
+
+        _metrics["active_search_requests"].add(1)
+        _t0 = _time.perf_counter()
+        try:
+            # Execute search through orchestrator (offloaded to thread to avoid blocking the event loop)
+            orch_response = await asyncio.to_thread(
+                orchestrator.search,
+                request.query,
+                request.limit,
+                request.page,
+                trace_id,
+                request.include_reasoning,
+                request.filters.model_dump(exclude_none=True) if request.filters else {}
+            )
+        finally:
+            _metrics["active_search_requests"].add(-1)
+
+        _query_type = orch_response.intent.get("category", "unknown") if orch_response.intent else "unknown"
+        _duration_ms = int((_time.perf_counter() - _t0) * 1000)
+        _attrs = {"query_type": _query_type}
+        _metrics["search_requests_total"].add(1, _attrs)
+        _metrics["search_latency_ms"].record(_duration_ms, _attrs)
         
         # Create response with metadata
         search_response = SearchResponse(
@@ -187,13 +200,13 @@ async def intelligent_search(
             response.headers[header_name] = str(header_value)
         
         # Log observability data
-        observability.log_search_execution(
+        log_search_execution(
             trace_id=orch_response.trace_id,
             strategy=orch_response.intent.get("category"),
             query=request.query,
             total_results=len(orch_response.results),
             execution_time_ms=orch_response.metadata["response_time_ms"],
-            score_info=orch_response.metadata["search_execution"].get("score_range", {})
+            score_info=orch_response.metadata["search_execution"].get("score_range", {}),
         )
         
         logger.info(
@@ -215,91 +228,8 @@ async def intelligent_search(
 
 
 # ============================================================================
-# Batch Search Endpoint
-# ============================================================================
-
-class BatchSearchRequest(BaseModel):
-    """Batch search request"""
-    queries: List[str] = Field(..., min_items=1, max_items=50)
-    limit: int = Field(20, ge=1, le=100)
-
-
-class BatchSearchResponse(BaseModel):
-    """Batch search response"""
-    total_queries: int
-    successful: int
-    failed: int
-    results: List[SearchResponse]
-
-
-@router.post(
-    "/batch",
-    response_model=BatchSearchResponse,
-    summary="Batch search multiple queries",
-    description="Execute multiple searches efficiently in one request"
-)
-async def batch_search(request: BatchSearchRequest):
-    """
-    Execute multiple searches in a single batch request.
-    
-    Useful for:
-    - Benchmarking performance
-    - Evaluating multiple queries
-    - Batch processing datasets
-    
-    Returns results for each query with unified response format.
-    """
-    try:
-        orchestrator = get_search_orchestrator()
-
-        responses = await asyncio.to_thread(
-            orchestrator.batch_search,
-            request.queries,
-            request.limit
-        )
-        
-        successful = sum(1 for r in responses if r.metadata.get("response_time_ms", 0) >= 0)
-        
-        batch_response = BatchSearchResponse(
-            total_queries=len(request.queries),
-            successful=successful,
-            failed=len(request.queries) - successful,
-            results=[
-                SearchResponse(
-                    query=r.query,
-                    results=[CompanyResult(**result) for result in r.results],
-                    metadata={
-                        "trace_id": r.trace_id,
-                        "query_classification": r.intent,
-                        "search_execution": r.metadata.get("search_execution", {}),
-                        "total_results": len(r.results),
-                        "response_time_ms": r.metadata.get("response_time_ms", 0),
-                        "page": r.metadata.get("page", 1),
-                        "limit": r.metadata.get("limit", 20)
-                    }
-                )
-                for r in responses
-            ]
-        )
-        
-        logger.info(
-            "batch_search_completed",
-            total_queries=len(request.queries),
-            successful=successful
-        )
-        
-        return batch_response
-        
-    except Exception as e:
-        logger.error("batch_search_failed", error=str(e))
-        raise HTTPException(status_code=500, detail="Batch search failed. See server logs for details.")
-
-
-# ============================================================================
 # Basic Structured Search Endpoint (delegates to SearchService via Orchestrator)
 # ============================================================================
-
-from app.models.search import BasicSearchRequest, BasicSearchResponse
 
 
 @router.post(
@@ -357,7 +287,6 @@ async def get_features():
             "agentic_search": settings.ENABLE_AGENTIC_SEARCH,
             "result_caching": settings.ENABLE_CACHING,
             "tracing": settings.ENABLE_TRACING,
-            "langsmith": settings.ENABLE_LANGSMITH
         },
         "models": {
             "classifier": settings.OPENAI_MINI_MODEL,

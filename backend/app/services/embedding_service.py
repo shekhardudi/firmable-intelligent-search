@@ -1,149 +1,151 @@
 """
-Embedding Service - Generates vector embeddings using msmarco-distilbert-base-tas-b.
-Supports local model loading for fast inference without API calls.
+Embedding Service - Generates vector embeddings using a sentence-transformers model.
+All model configuration (name, dimension, query prefix) is driven
+from search_config.yaml under the `embedding:` key — no hardcoded values here.
+
+BGE asymmetric retrieval:
+  - Queries:    encoded with `query_prefix` prepended
+  - Documents:  encoded as plain text (no prefix)
+For symmetric models (e.g. all-MiniLM), set query_prefix to "".
 """
 import structlog
-import os
 from functools import lru_cache
-from typing import Dict, List, Optional
+from typing import List, Optional
 import numpy as np
-from pathlib import Path
 from sentence_transformers import SentenceTransformer
+from app.config import get_search_config
+from app.utils.cache import BoundedDict
+
 logger = structlog.get_logger(__name__)
+
+
+def _get_embedding_config() -> dict:
+    """Return the embedding sub-section of search_config.yaml."""
+    return get_search_config().get("embedding", {})
 
 
 class EmbeddingService:
     """
-    Generates embeddings using sentence-transformers and the local msmarco model.
-    This model is specifically tuned for information retrieval and ranked well
-    in the MTEB benchmark for retrieval tasks.
+    Generates embeddings using sentence-transformers.
+    Model, dimension, query prefix, and batch sizes are all read from
+    search_config.yaml so they can be changed without touching this file.
     """
-    
+
     def __init__(self, model_path: Optional[str] = None):
         """
-        Initialize embedding service with local model.
-        
+        Initialise the embedding service.
+
         Args:
-            model_path: Path to local msmarco model directory.
-                       If None, will use default location.
+            model_path: Override the model name / path from config.
+                        Useful in tests or when passing an explicit local path.
         """
-        self.model_path = model_path or self._find_local_model()
-        self._model = None  # Lazy-load model on first use
-        self.embedding_dim = 768  # msmarco output dimension
-        self._embed_cache: Dict[str, List[float]] = {}
-        self._cache_maxsize = 512
-        
+        cfg = _get_embedding_config()
+
+        self._query_prefix: str = cfg.get("query_prefix", "")
+        # Configured dimension is used as the fallback for zero-vectors before
+        # the model is loaded; overridden by the actual model once loaded.
+        self._configured_dim: int = int(cfg.get("dimension", 768))
+
+        self.model_path: str = model_path or cfg.get("model", "BAAI/bge-base-en-v1.5")
+        self._model: Optional[SentenceTransformer] = None  # lazy-loaded
+
+        _maxsize = get_search_config().get("cache", {}).get("embedding_maxsize", 512)
+        self._embed_cache: BoundedDict = BoundedDict(maxsize=_maxsize)
+        self._cache_maxsize: int = _maxsize
+
         logger.info(
             "embedding_service_initialized",
             model_path=self.model_path,
-            embedding_dim=self.embedding_dim
+            configured_dim=self._configured_dim,
+            query_prefix=repr(self._query_prefix),
         )
-    
-    def _find_local_model(self) -> str:
-        """Find local msmarco model directory"""
-        # Check common locations
-        workspace_root = Path(__file__).parent.parent.parent
-        possible_paths = [
-            workspace_root / "msmarco-distilbert-base-tas-b",
-            workspace_root / "backend" / "msmarco-distilbert-base-tas-b",
-            Path.home() / "models" / "msmarco-distilbert-base-tas-b",
-        ]
-        
-        for path in possible_paths:
-            if path.exists():
-                logger.info("local_model_found", path=str(path))
-                return str(path)
-        
-        # Default to the HuggingFace model
-        default = "sentence-transformers/msmarco-distilbert-base-tas-b"
-        logger.warning(
-            "local_model_not_found_using_hf",
-            fallback_model=default
-        )
-        return default
-    
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
     @property
-    def model(self):
-        """Lazy-load the sentence-transformer model"""
+    def model(self) -> SentenceTransformer:
+        """Lazy-load the sentence-transformer model on first access."""
         if self._model is None:
+            logger.info("loading_sentence_transformer", model_path=self.model_path)
             try:
-                from sentence_transformers import SentenceTransformer
                 self._model = SentenceTransformer(self.model_path)
                 logger.info("sentence_transformer_model_loaded")
             except Exception as e:
                 logger.error("model_loading_failed", error=str(e))
                 raise
-        
         return self._model
-    
+
+    @property
+    def embedding_dim(self) -> int:
+        """Actual output dimension — introspected from the loaded model when available."""
+        if self._model is not None:
+            try:
+                dim = self._model.get_sentence_embedding_dimension()
+                if isinstance(dim, int):
+                    return dim
+            except Exception:
+                pass
+        return self._configured_dim
+
+    def get_embedding_dimension(self) -> int:
+        """Public accessor for the embedding vector dimension."""
+        return self.embedding_dim
+
+    def _zero_vector(self) -> List[float]:
+        return [0.0] * self.embedding_dim
+
+    # ------------------------------------------------------------------
+    # Single-text encode
+    # ------------------------------------------------------------------
+
     def embed(self, text: str) -> List[float]:
         """
-        Generate embedding for a single text.
-        
-        Args:
-            text: Text to embed
-        
-        Returns:
-            Embedding vector as list of floats
+        Encode a query string with the configured query prefix.
+        Use at search time — NOT when indexing documents.
         """
         if not text or not text.strip():
             logger.warning("empty_text_embedding_requested")
-            return [0.0] * self.embedding_dim
+            return self._zero_vector()
 
-        cache_key = text.strip()
+        cache_key = f"q:{text.strip()}"
         if cache_key in self._embed_cache:
             return self._embed_cache[cache_key]
 
         try:
-            embedding = self.model.encode(text, convert_to_tensor=False)
-            result = embedding.tolist() if isinstance(embedding, np.ndarray) else embedding
-            if len(self._embed_cache) >= self._cache_maxsize:
-                self._embed_cache.pop(next(iter(self._embed_cache)))
+            prefixed = self._query_prefix + text.strip()
+            raw = self.model.encode(prefixed, convert_to_tensor=False, normalize_embeddings=True)
+            result: List[float] = raw.tolist() if isinstance(raw, np.ndarray) else list(raw)
             self._embed_cache[cache_key] = result
             return result
         except Exception as e:
             logger.error("embedding_generation_failed", error=str(e), text=text[:100])
             raise
-    
-    def embed_batch(self, texts: List[str], batch_size: int = 32) -> List[List[float]]:
+
+    def embed_document(self, text: str) -> List[float]:
         """
-        Generate embeddings for multiple texts efficiently.
-        
-        Args:
-            texts: List of texts to embed
-            batch_size: Batch size for processing
-        
-        Returns:
-            List of embedding vectors
+        Encode a document string WITHOUT the query prefix.
+        Use when indexing company documents — NOT at search time.
         """
-        if not texts:
-            logger.warning("empty_texts_batch_embedding_requested")
-            return []
-        
+        if not text or not text.strip():
+            logger.warning("empty_text_embedding_requested")
+            return self._zero_vector()
+
+        cache_key = f"d:{text.strip()}"
+        if cache_key in self._embed_cache:
+            return self._embed_cache[cache_key]
+
         try:
-            embeddings = self.model.encode(
-                texts,
-                batch_size=batch_size,
-                convert_to_tensor=False,
-                show_progress_bar=False
-            )
-            
-            # Convert to list of lists
-            if isinstance(embeddings, np.ndarray):
-                return embeddings.tolist()
-            return embeddings
-        
+            raw = self.model.encode(text.strip(), convert_to_tensor=False, normalize_embeddings=True)
+            result: List[float] = raw.tolist() if isinstance(raw, np.ndarray) else list(raw)
+            self._embed_cache[cache_key] = result
+            return result
         except Exception as e:
-            logger.error(
-                "batch_embedding_generation_failed",
-                error=str(e),
-                batch_size=len(texts)
-            )
+            logger.error("document_embedding_generation_failed", error=str(e), text=text[:100])
             raise
-    
-    def get_embedding_dimension(self) -> int:
-        """Get embedding vector dimension"""
-        return self.embedding_dim
+
+
 
 
 # ============================================================================

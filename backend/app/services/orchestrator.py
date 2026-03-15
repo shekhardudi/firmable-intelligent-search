@@ -3,9 +3,9 @@ Search Orchestrator - Main coordinator for the intelligent search pipeline.
 Routes queries through intent classification and strategically executes searches.
 Manages observability, tracing, and hybrid result merging.
 """
+import re
 import structlog
 import time
-import uuid
 from functools import lru_cache
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
@@ -20,8 +20,52 @@ from app.services.search_strategies import (
     SearchContext, SearchResult, RegularSearchStrategy,
     SemanticSearchStrategy, AgenticSearchStrategy
 )
+from app.observability import generate_trace_id
 
 logger = structlog.get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Regex pre-classifier — bypasses the LLM for obviously REGULAR queries.
+# A query is REGULAR when it is clearly an exact name/domain lookup.
+# ---------------------------------------------------------------------------
+
+# Quoted exact phrase:  "Apple Inc"
+_QUOTED_RE = re.compile(r'^"[^"]+"\s*$')
+
+# Domain-style query:   google.com, stripe.io
+_DOMAIN_RE = re.compile(
+    r'^[\w.-]+\.(com|io|co|net|org|ai|app|tech|dev|biz|info)\b',
+    re.IGNORECASE,
+)
+
+# Company legal suffix: Apple Inc, Stripe Ltd, Klarna AB
+_COMPANY_SUFFIX_RE = re.compile(
+    r'\b(inc\.?|incorporated|ltd\.?|limited|llc|corp\.?|corporation|'
+    r'gmbh|plc|pty\s*ltd|s\.?a\.?|a\.?g\.?|b\.?v\.?|n\.?v\.?|'
+    r's\.r\.l\.?|l\.?l\.?p\.?|holdings?)\b',
+    re.IGNORECASE,
+)
+
+# Signals that disqualify regex-REGULAR → must go to LLM
+_SEMANTIC_DISQUALIFY_RE = re.compile(
+    r'\b(who|what|where|how|which|why|like|similar|comparable|'
+    r'type\s+of|kind\s+of|innovative|leading|top|best|fastest?|'
+    r'largest?|biggest?|growing|focused\s+on|specializ|dealing\s+in|'
+    r'providing|offering|that\s+(do|make|sell|build|offer|provide|work))\b',
+    re.IGNORECASE,
+)
+
+_AGENTIC_DISQUALIFY_RE = re.compile(
+    r'\b(funded|funding|raised|series\s+[abcde]|ipo|acquired|acquisition|'
+    r'merger|revenue|valuation|unicorn|investors?|news|recent|latest|announced)\b',
+    re.IGNORECASE,
+)
+
+# Optional "in / from / based in / headquartered in <location>" suffix
+_LOCATION_SUFFIX_RE = re.compile(
+    r'\s+(?:in|from|based\s+in|headquartered\s+in)\s+(.+)$',
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -86,7 +130,7 @@ class SearchOrchestrator:
         Returns:
             IntelligentSearchResponse with results and metadata
         """
-        trace_id = trace_id or str(uuid.uuid4())[:12]
+        trace_id = trace_id or generate_trace_id()
         start_time = time.time()
         
         logger.info(
@@ -99,13 +143,19 @@ class SearchOrchestrator:
         
         try:
             # Step 1: Classify Intent
-            intent = self.classifier.classify(query, trace_id)
-            
+            # Fast regex pre-classifier runs first; LLM classifier is the fallback
+            # for queries that are ambiguous or clearly semantic/agentic.
+            intent = self._regex_classify(query)
+            classified_by_regex = intent is not None
+            if intent is None:
+                intent = self.classifier.classify(query, trace_id)
+
             logger.info(
                 "query_intent_determined",
                 trace_id=trace_id,
                 category=intent.category.value,
-                confidence=intent.confidence
+                confidence=intent.confidence,
+                classified_by="regex" if classified_by_regex else "llm",
             )
             
             # Step 2: Build search context
@@ -149,7 +199,8 @@ class SearchOrchestrator:
                     "category": intent.category.value,
                     "confidence": intent.confidence,
                     "reasoning": intent.reasoning,
-                    "needs_external_data": intent.needs_external_data
+                    "needs_external_data": intent.needs_external_data,
+                    "classified_by": "regex" if classified_by_regex else "llm",
                 },
                 "search_execution": search_metadata,
                 "total_results": len(formatted_results),
@@ -193,6 +244,66 @@ class SearchOrchestrator:
             )
             raise
     
+    def _regex_classify(self, query: str) -> Optional[QueryIntent]:
+        """
+        Fast regex pre-classifier. Returns a REGULAR QueryIntent immediately
+        for obvious exact/name-lookup queries, skipping the LLM entirely.
+        Returns None when uncertain — the LLM classifier takes over.
+
+        Matches on:
+          - Quoted exact phrases: "Stripe Inc"
+          - Domain-style queries: stripe.com
+          - Company name with legal suffix: Stripe Ltd, Klarna AB
+
+        Disqualifies (returns None) if semantic or agentic signal words are
+        detected anywhere in the query.
+        """
+        q = query.strip()
+        if not q:
+            return None
+
+        # Any conceptual or external-data signal → must use LLM
+        if _SEMANTIC_DISQUALIFY_RE.search(q) or _AGENTIC_DISQUALIFY_RE.search(q):
+            return None
+
+        is_regular = (
+            bool(_QUOTED_RE.match(q))
+            or bool(_DOMAIN_RE.match(q))
+            or bool(_COMPANY_SUFFIX_RE.search(q))
+        )
+        if not is_regular:
+            return None
+
+        # Extract optional "in <location>" suffix as a generic location filter.
+        # Using the broad "location" key so search_strategies can match it
+        # against country, state, or city without forcing a specific type here.
+        filters: Dict[str, Any] = {}
+        search_query = q
+        loc_match = _LOCATION_SUFFIX_RE.search(q)
+        if loc_match:
+            filters["location"] = loc_match.group(1).strip()
+            search_query = q[: loc_match.start()].strip()
+
+        # Strip surrounding quotes so the raw term reaches OpenSearch
+        if _QUOTED_RE.match(search_query):
+            search_query = search_query.strip('"').strip()
+
+        logger.info(
+            "query_classified_by_regex",
+            query=q[:100],
+            search_query=search_query,
+            filters=filters,
+        )
+        return QueryIntent(
+            category=SearchIntent.REGULAR,
+            confidence=0.95,
+            filters=filters,
+            search_query=search_query,
+            needs_external_data=False,
+            field_boosts={},
+            reasoning="Regex pre-classifier: query matches exact/name-lookup pattern — LLM skipped",
+        )
+
     def _merge_filters(
         self,
         intent_filters: Dict[str, Any],
@@ -219,7 +330,9 @@ class SearchOrchestrator:
             normalised_user["location_state"] = user_filters["state"]
         if user_filters.get("city"):
             normalised_user["location_city"] = user_filters["city"]
-        if user_filters.get("industry"):
+        if user_filters.get("industries"):
+            normalised_user["industries"] = user_filters["industries"]
+        elif user_filters.get("industry"):  # backward-compat: classifier outputs single string
             normalised_user["industry"] = user_filters["industry"]
         if user_filters.get("year_from"):
             normalised_user["year_from"] = user_filters["year_from"]
@@ -308,43 +421,6 @@ class SearchOrchestrator:
         }
         return logic_map.get(intent.category, "Unknown")
     
-    def batch_search(
-        self,
-        queries: List[str],
-        limit: int = 20
-    ) -> List[IntelligentSearchResponse]:
-        """
-        Execute multiple searches efficiently.
-        Useful for benchmarking or batch processing.
-        
-        Args:
-            queries: List of queries to search
-            limit: Results per query
-        
-        Returns:
-            List of IntelligentSearchResponse objects
-        """
-        batch_trace_id = str(uuid.uuid4())[:12]
-        logger.info(
-            "batch_search_started",
-            batch_trace_id=batch_trace_id,
-            query_count=len(queries)
-        )
-        
-        results = []
-        for i, query in enumerate(queries):
-            trace_id = f"{batch_trace_id}_{i}"
-            response = self.search(query, limit=limit, trace_id=trace_id)
-            results.append(response)
-        
-        logger.info(
-            "batch_search_completed",
-            batch_trace_id=batch_trace_id,
-            processed=len(results)
-        )
-        
-        return results
-
     def basic_search(self, request):
         """
         Delegate basic structured search (with facets) to SearchService.

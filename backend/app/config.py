@@ -3,9 +3,11 @@ Configuration management for the search application.
 Handles environment variables and application settings.
 """
 from functools import lru_cache
-from typing import Optional
+from pathlib import Path
+from typing import Any, Dict, Optional
 from pydantic_settings import BaseSettings
 import os
+import yaml
 
 
 class Settings(BaseSettings):
@@ -88,13 +90,15 @@ class Settings(BaseSettings):
     MIN_SEMANTIC_SCORE: float = 0.3
     
     # Tracing & Observability
-    LANGSMITH_API_KEY: Optional[str] = None
-    LANGSMITH_PROJECT: str = "firmable-search"
     ENABLE_TRACING: bool = True
-    ENABLE_LANGSMITH: bool = False
-    JAEGER_AGENT_HOST: str = "localhost"
-    JAEGER_AGENT_PORT: int = 6831
-    
+
+    # OpenTelemetry — app sends to OTel Collector via OTLP/gRPC
+    OTLP_ENDPOINT: str = "http://localhost:4317"
+    OTEL_SERVICE_NAME: str = "firmable-search"
+
+    # Search config file path (relative to backend/ directory or absolute)
+    SEARCH_CONFIG_PATH: str = "search_config.yaml"
+
     class Config:
         env_file = ".env"
         case_sensitive = True
@@ -127,3 +131,15 @@ def get_settings() -> Settings:
         OPENAI_API_KEY=os.getenv("OPENAI_API_KEY", ""),
         ANTHROPIC_API_KEY=os.getenv("ANTHROPIC_API_KEY", "")
     )
+
+
+@lru_cache(maxsize=1)
+def get_search_config() -> Dict[str, Any]:
+    """Load and cache search_config.yaml from the backend directory."""
+    settings = get_settings()
+    config_path = Path(settings.SEARCH_CONFIG_PATH)
+    if not config_path.is_absolute():
+        # Resolve relative to the backend/ directory (parent of app/)
+        config_path = Path(__file__).parent.parent / config_path
+    with config_path.open() as fh:
+        return yaml.safe_load(fh)
