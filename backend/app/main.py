@@ -21,7 +21,7 @@ from app.api import routes
 # Logging — configured at import time so every module sees JSON output.
 # ---------------------------------------------------------------------------
 from app.observability import configure_logging
-configure_logging()
+configure_logging(get_settings().LOG_LEVEL)
 
 logger = structlog.get_logger(__name__)
 

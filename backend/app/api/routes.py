@@ -3,18 +3,23 @@ API route handlers for intelligent search endpoints.
 Uses the new orchestrator-based architecture with intent classification,
 strategy routing, and hybrid search.
 """
+import functools
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter, Query, HTTPException, Header, Response
 from typing import List, Optional, Dict, Any
 import asyncio
 import structlog
 from pydantic import BaseModel, Field
 
+from app.config import get_settings
 from app.services.orchestrator import get_search_orchestrator
 from app.models.search import BasicSearchRequest, BasicSearchResponse
 from app.observability import log_search_execution
 import time as _time
 from app.observability.metrics import get_search_metrics
 logger = structlog.get_logger(__name__)
+
+_THREAD_POOL = ThreadPoolExecutor(max_workers=128)
 
 router = APIRouter(prefix="/api/search", tags=["search"])
 
@@ -70,6 +75,7 @@ class CompanyResult(BaseModel):
     year_founded: Optional[int] = None
     size_range: Optional[str] = None
     current_employee_estimate: Optional[int] = None
+    event_data: Optional[Dict[str, Any]] = None
 
 
 class SearchMetadata(BaseModel):
@@ -104,7 +110,7 @@ class SearchResponse(BaseModel):
 async def intelligent_search(
     request: SearchRequest,
     trace_id: Optional[str] = Header(None, description="Optional trace ID for correlation"),
-    response: Optional[Response] = None,
+    response: Response = None,
 ):
     """
     Intelligent search with automatic query classification and strategy routing.
@@ -160,16 +166,21 @@ async def intelligent_search(
         _metrics["active_search_requests"].add(1)
         _t0 = _time.perf_counter()
         try:
-            # Execute search through orchestrator (offloaded to thread to avoid blocking the event loop)
-            orch_response = await asyncio.to_thread(
+            _search_fn = functools.partial(
                 orchestrator.search,
                 request.query,
                 request.limit,
                 request.page,
                 trace_id,
                 request.include_reasoning,
-                request.filters.model_dump(exclude_none=True) if request.filters else {}
+                request.filters.model_dump(exclude_none=True) if request.filters else {},
             )
+            orch_response = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(_THREAD_POOL, _search_fn),
+                timeout=get_settings().SEARCH_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Search timed out.")
         finally:
             _metrics["active_search_requests"].add(-1)
 

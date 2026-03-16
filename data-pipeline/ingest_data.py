@@ -5,6 +5,7 @@ Handles reading CSV data and indexing into OpenSearch.
 from datetime import datetime
 
 import json
+import os
 import pandas as pd
 import sys
 import yaml
@@ -67,9 +68,10 @@ def parse_locality(locality: str) -> tuple[str, str]:
 class DataIngestionPipeline:
     """Pipeline for ingesting company data into OpenSearch"""
     
-    def __init__(self, opensearch_host="localhost", opensearch_port=443, 
-                 opensearch_user="admin", opensearch_password="MySecurePassword123!"):
+    def __init__(self, opensearch_host="localhost", opensearch_port=9200,
+                 opensearch_user="admin", opensearch_password=None):
         """Initialize the ingestion pipeline"""
+        opensearch_password = opensearch_password or os.getenv("OPENSEARCH_PASSWORD", "")
         try:
             self.client = OpenSearch(
                 hosts=[{

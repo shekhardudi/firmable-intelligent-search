@@ -1,0 +1,149 @@
+# AWS Architecture — Production Deployment
+
+## Overview
+
+Production-grade deployment targeting **60 RPS** sustained throughput with
+auto-scaling, managed data stores, and full observability. All compute runs
+inside a VPC with private subnets; only the ALB is internet-facing.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           AWS Production Architecture                        │
+│                                                                             │
+│   Internet                                                                  │
+│      │                                                                      │
+│      ▼                                                                      │
+│   Route 53  (DNS, health-check failover)                                    │
+│      │                                                                      │
+│      ▼                                                                      │
+│   ACM (TLS certificate)                                                     │
+│      │                                                                      │
+│      ▼                                                                      │
+│   ┌──────────────────────────────────────────────────────────┐              │
+│   │  Application Load Balancer  (internet-facing)            │              │
+│   │  Listener: HTTPS :443 → Target Group (backend ECS)       │              │
+│   └─────────────────────────┬────────────────────────────────┘              │
+│                             │                                               │
+│   ┌─────────────────────────▼──────────────────────────────────────────┐   │
+│   │  VPC  (private subnets, multi-AZ)                                  │   │
+│   │                                                                    │   │
+│   │  ┌────────────────────────────────────────────────────────────┐   │   │
+│   │  │  ECS Cluster (Fargate)                                      │   │   │
+│   │  │                                                             │   │   │
+│   │  │  ┌──────────────────────────────────────────────────┐      │   │   │
+│   │  │  │  Backend Service  (FastAPI)                        │      │   │   │
+│   │  │  │  Tasks: 4–20  (target CPU 60%, scale on p95 lat)  │      │   │   │
+│   │  │  │  CPU: 2 vCPU   Memory: 4 GB                       │      │   │   │
+│   │  │  │  ThreadPoolExecutor(128) per task                  │      │   │   │
+│   │  │  └──────────┬─────────────────┬────────────────┬─────┘      │   │   │
+│   │  │             │                 │                │             │   │   │
+│   │  │             ▼                 ▼                ▼             │   │   │
+│   │  │  ┌─────────────────┐  ┌───────────┐  ┌────────────────┐    │   │   │
+│   │  │  │ Intent Queries  │  │  Regular/ │  │ Agentic Queries│    │   │   │
+│   │  │  │ (OpenAI API)    │  │ Semantic  │  │ → SQS Queue    │    │   │   │
+│   │  │  │ (external)      │  │  Queries  │  └───────┬────────┘    │   │   │
+│   │  │  └─────────────────┘  └─────┬─────┘          │             │   │   │
+│   │  │                             │                 │             │   │   │
+│   │  │  ┌──────────────────────────▼──────────┐     │             │   │   │
+│   │  │  │  Agentic Worker Service  (Fargate)  │◄────┘             │   │   │
+│   │  │  │  Tasks: 2–10  (scale on SQS depth)  │                   │   │   │
+│   │  │  │  CPU: 2 vCPU   Memory: 4 GB         │                   │   │   │
+│   │  │  │  LangChain Agent + Tavily + OpenAI  │                   │   │   │
+│   │  │  └─────────────────────────────────────┘                   │   │   │
+│   │  │                                                             │   │   │
+│   │  └─────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                    │   │
+│   │  ┌──────────────────────┐   ┌────────────────────────────────┐   │   │
+│   │  │  Amazon OpenSearch   │   │  ElastiCache (Redis OSS)       │   │   │
+│   │  │  Service             │   │  Cluster mode, 2 shards        │   │   │
+│   │  │  3-node data cluster │   │  (intent classifier cache,     │   │   │
+│   │  │  (r6g.large.search)  │   │   query result cache)          │   │   │
+│   │  │  768-dim kNN index   │   └────────────────────────────────┘   │   │
+│   │  └──────────────────────┘                                         │   │
+│   │                                                                    │   │
+│   │  ┌──────────────────────┐   ┌────────────────────────────────┐   │   │
+│   │  │  Amazon SQS          │   │  AWS Secrets Manager           │   │   │
+│   │  │  agentic-query-queue │   │  OPENAI_API_KEY                │   │   │
+│   │  │  (FIFO, deduplication│   │  TAVILY_API_KEY                │   │   │
+│   │  │   by query hash)     │   │  OPENSEARCH credentials        │   │   │
+│   │  └──────────────────────┘   └────────────────────────────────┘   │   │
+│   │                                                                    │   │
+│   └────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐  │
+│   │  Observability                                                       │  │
+│   │                                                                      │  │
+│   │  ECS Tasks ──OTLP──▶ AWS Distro for OTel (ADOT) Collector (sidecar) │  │
+│   │                              │                                       │  │
+│   │               ┌──────────────┼──────────────────┐                   │  │
+│   │               ▼              ▼                  ▼                   │  │
+│   │        CloudWatch        X-Ray                Managed               │  │
+│   │        Metrics &         Traces               Prometheus            │  │
+│   │        Logs              (distributed         (AMP) + Grafana       │  │
+│   │                           tracing)            (AMG dashboards)      │  │
+│   └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐  │
+│   │  CI/CD & Container Registry                                          │  │
+│   │                                                                      │  │
+│   │  GitHub Actions ──push──▶ ECR (backend + worker images)             │  │
+│   │                  ──deploy──▶ ECS rolling update (blue/green)        │  │
+│   │                                                                      │  │
+│   │  S3: embedding model artefacts (msmarco-distilbert-base-tas-b)      │  │
+│   │      loaded at container start via ECS task role                    │  │
+│   └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Capacity Model (60 RPS)
+
+| Path       | Avg latency | Concurrency needed | Fargate tasks |
+|------------|-------------|-------------------|---------------|
+| Regular    | 120 ms      | 60 × 0.12 = 7     | 2 (burst 4)   |
+| Semantic   | 200 ms      | 60 × 0.20 = 12    | 2 (burst 4)   |
+| Agentic    | 8–15 s      | 5% × 60 × 10 = 30 | 4 (burst 10)  |
+| **Total**  |             | **~50 threads**    | **4 min → 20 max** |
+
+ThreadPoolExecutor(128) per backend task gives headroom for 64 RPS at 2s average without blocking the event loop.
+
+## Scaling Triggers
+
+| Metric                        | Scale-out threshold | Scale-in threshold |
+|-------------------------------|---------------------|--------------------|
+| ECS CPU utilisation           | > 60%               | < 30%              |
+| ALB p95 target response time  | > 2 000 ms          | < 500 ms           |
+| SQS agentic queue depth       | > 50 messages       | < 5 messages       |
+| ElastiCache memory            | > 75%               | —                  |
+
+## Network Topology
+
+```
+  Public Subnets (2 AZs)         Private Subnets (2 AZs)
+  ┌───────────────────┐          ┌───────────────────────────────────┐
+  │  ALB (internet-   │          │  ECS Backend tasks                │
+  │  facing)          │──────────│  ECS Agentic Worker tasks         │
+  │  NAT Gateway      │          │  OpenSearch Service domain        │
+  └───────────────────┘          │  ElastiCache subnet group         │
+                                 │  SQS VPC endpoint                 │
+                                 │  Secrets Manager VPC endpoint     │
+                                 └───────────────────────────────────┘
+```
+
+## Key AWS Services
+
+| Component              | AWS Service                      | Notes                                          |
+|------------------------|----------------------------------|------------------------------------------------|
+| Load balancer          | ALB                              | HTTP/2, connection draining 30 s              |
+| Container orchestration| ECS Fargate                     | No EC2 management; isolated per task           |
+| Search engine          | Amazon OpenSearch Service        | 3-node data cluster, UltraWarm for cold data   |
+| Cache                  | ElastiCache for Redis OSS        | Cluster mode; 2 shards, 1 replica each         |
+| Async queue            | SQS FIFO                         | Deduplication by SHA-256(query)                |
+| Secrets                | AWS Secrets Manager              | Rotated API keys; ECS task IAM role            |
+| Container registry     | Amazon ECR                       | Image scanning enabled                         |
+| Tracing                | AWS X-Ray via ADOT               | Instrumented with OTel SDK                     |
+| Metrics                | Amazon Managed Prometheus (AMP)  | Scraped from ADOT collector sidecar            |
+| Dashboards             | Amazon Managed Grafana (AMG)     | Pre-built: latency, throughput, error rate     |
+| Logs                   | CloudWatch Logs                  | Structured JSON via structlog                  |
+| DNS                    | Route 53                         | Latency-based routing, health-check failover   |
+| TLS                    | ACM (auto-renew)                 | SNI on ALB                                     |

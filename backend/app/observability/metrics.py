@@ -7,13 +7,13 @@ Call configure_metrics() once at startup.
 Instruments are created lazily on first call to get_search_metrics() so they
 always bind to whichever MeterProvider is currently installed (NoOp before
 configure_metrics() is called, real provider after).
+
+If the OTLP collector is unreachable at startup the function silently installs
+a no-op provider so the app starts cleanly with no retry spam.
 """
 import structlog
 from typing import Any, Dict
 from opentelemetry import metrics
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
 from opentelemetry.sdk.resources import Resource, SERVICE_NAME
 
 logger = structlog.get_logger(__name__)
@@ -21,18 +21,59 @@ logger = structlog.get_logger(__name__)
 _INSTRUMENTS: Dict[str, Any] = {}
 
 
+def _is_grpc_endpoint_reachable(
+    endpoint: str, retries: int = 3, timeout: float = 2.0
+) -> bool:
+    """TCP probe to see if the OTLP gRPC endpoint is accepting connections.
+
+    Retries up to *retries* times with a 1-second delay between attempts so
+    that ECS sidecar containers (ADOT collector) have time to start alongside
+    the app container without permanently disabling telemetry.
+    """
+    import socket
+    import time
+    import urllib.parse
+    parsed = urllib.parse.urlparse(endpoint)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 4317
+    for attempt in range(retries):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            if attempt < retries - 1:
+                time.sleep(1)
+    return False
+
+
 def configure_metrics(service_name: str, otlp_endpoint: str) -> None:
     """
     Set up OTLP/gRPC metric exporter and install as the global MeterProvider.
+    Falls back to a no-op provider when the collector is unreachable.
 
     Args:
         service_name: Logical service name embedded in every metric.
         otlp_endpoint: OTLP collector gRPC address, e.g. "http://otel-collector:4317".
     """
-    try:
-      
+    resource = Resource.create({SERVICE_NAME: service_name})
 
-        resource = Resource.create({SERVICE_NAME: service_name})
+    if not _is_grpc_endpoint_reachable(otlp_endpoint):
+        logger.warning(
+            "otel_collector_unreachable_metrics_disabled",
+            endpoint=otlp_endpoint,
+            hint="Start an OTel Collector to enable metrics export.",
+        )
+        # Install a real MeterProvider with no readers — instruments work but
+        # nothing is exported, and there are no background retry threads.
+        from opentelemetry.sdk.metrics import MeterProvider
+        metrics.set_meter_provider(MeterProvider(resource=resource))
+        return
+
+    try:
+        from opentelemetry.sdk.metrics import MeterProvider
+        from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+        from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+
         exporter = OTLPMetricExporter(endpoint=otlp_endpoint, insecure=True)
         reader = PeriodicExportingMetricReader(exporter, export_interval_millis=30_000)
         provider = MeterProvider(resource=resource, metric_readers=[reader])

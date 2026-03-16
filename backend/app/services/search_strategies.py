@@ -6,14 +6,25 @@ import structlog
 import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Any, Optional
-from dataclasses import dataclass
+from pydantic import BaseModel
 from app.config import get_settings, get_search_config
 
 logger = structlog.get_logger(__name__)
 
 
-@dataclass
-class SearchResult:
+class EventData(BaseModel):
+    """Structured event data attached to agentic search results."""
+    event_type: str = "other"
+    amount: Optional[str] = None
+    round: Optional[str] = None
+    date: Optional[str] = None
+    summary: Optional[str] = None
+    source_url: Optional[str] = None
+
+    model_config = {"extra": "ignore"}
+
+
+class SearchResult(BaseModel):
     """Unified search result across all strategies"""
     company_id: str
     company_name: str
@@ -28,10 +39,10 @@ class SearchResult:
     year_founded: Optional[int] = None
     size_range: Optional[str] = None
     current_employee_estimate: Optional[int] = None
+    event_data: Optional[EventData] = None
 
 
-@dataclass
-class SearchContext:
+class SearchContext(BaseModel):
     """Context passed through the search pipeline"""
     query: str
     filters: Dict[str, Any]
@@ -615,6 +626,12 @@ class AgenticSearchStrategy(SearchStrategy):
         results = []
         data_type = context.filters.get("external_data_type", "external")
         for doc in docs:
+            event = doc.get("_event_data")
+            if event and event.get("summary"):
+                date_suffix = f" ({event['date']})" if event.get("date") else ""
+                matching_reason = f"{event['summary']}{date_suffix}"
+            else:
+                matching_reason = f"Identified via {data_type} data for query: {context.query[:60]}"
             results.append(SearchResult(
                 company_id=doc.get("company_id", doc.get("_id", "")),
                 company_name=doc.get("name", ""),
@@ -625,7 +642,8 @@ class AgenticSearchStrategy(SearchStrategy):
                 relevance_score=float(doc.get("_score", 1.0)),
                 search_method=self.strategy_type,
                 ranking_source="tool",
-                matching_reason=f"Identified via {data_type} data for query: {context.query[:60]}"
+                matching_reason=matching_reason,
+                event_data=event,
             ))
         return results
 
@@ -650,7 +668,14 @@ class AgenticSearchStrategy(SearchStrategy):
                     continue
             filtered.append(r)
 
-        return filtered if filtered else results  # fallback: return unfiltered if nothing passes
+        if not filtered:
+            logger.warning(
+                "post_filter_dropped_all",
+                result_count=len(results),
+                filters=filters,
+            )
+            return []
+        return filtered
 
     def get_strategy_type(self) -> str:
         """Return strategy identifier"""

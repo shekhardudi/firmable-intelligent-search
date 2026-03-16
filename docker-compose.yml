@@ -42,28 +42,6 @@ services:
 
 
   # =========================================================================
-  # PostgreSQL - User Data & Tags
-  # =========================================================================
-  postgres:
-    image: postgres:16-alpine
-    container_name: firmable-postgres
-    environment:
-      - POSTGRES_DB=firmable_search
-      - POSTGRES_USER=firmable_user
-      - POSTGRES_PASSWORD=password123
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    networks:
-      - search-network
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U firmable_user -d firmable_search"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-  
-  # =========================================================================
   # Redis - Caching & Session Management
   # =========================================================================
   redis:
@@ -95,18 +73,16 @@ services:
     environment:
       - ENVIRONMENT=development
       - LOG_LEVEL=INFO
-      - DEBUG=true
       - OPENSEARCH_HOST=opensearch-node1
       - OPENSEARCH_PORT=9200
-      - DATABASE_URL=postgresql://firmable_user:password123@postgres:5432/firmable_search
+      - OPENSEARCH_PASSWORD=${OPENSEARCH_PASSWORD:-MySecurePassword123!}
       - REDIS_URL=redis://redis:6379/0
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
       - OTLP_ENDPOINT=http://otel-collector:4317
       - OTEL_SERVICE_NAME=firmable-search
     depends_on:
       opensearch-node1:
-        condition: service_started
-      postgres:
         condition: service_started
       redis:
         condition: service_started
@@ -205,7 +181,6 @@ services:
 
 volumes:
   opensearch-data:
-  postgres-data:
   redis-data:
   prometheus-data:
   grafana-data:

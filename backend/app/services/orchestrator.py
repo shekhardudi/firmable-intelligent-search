@@ -8,10 +8,10 @@ import structlog
 import time
 from functools import lru_cache
 from typing import Dict, List, Any, Optional, Tuple
-from dataclasses import dataclass
+from pydantic import BaseModel
 from enum import Enum
 
-from app.config import get_settings
+from app.config import get_settings, get_search_config
 from app.services.intent_classifier import get_intent_classifier, SearchIntent, QueryIntent
 from app.services.embedding_service import get_embedding_service
 from app.services.opensearch_service import get_opensearch_service
@@ -68,8 +68,7 @@ _LOCATION_SUFFIX_RE = re.compile(
 )
 
 
-@dataclass
-class IntelligentSearchResponse:
+class IntelligentSearchResponse(BaseModel):
     """Response from the orchestrator"""
     query: str
     trace_id: str
@@ -101,7 +100,14 @@ class SearchOrchestrator:
         # Initialize search strategies
         self.regular_strategy = RegularSearchStrategy(self.opensearch)
         self.semantic_strategy = SemanticSearchStrategy(self.opensearch, self.embeddings)
-        tool_service = ToolService(self.opensearch, self.settings.OPENAI_API_KEY, self.settings.OPENAI_MINI_MODEL)
+        _agentic_cfg = get_search_config().get("agentic", {})
+        tool_service = ToolService(
+            opensearch_service=self.opensearch,
+            openai_api_key=self.settings.OPENAI_API_KEY,
+            model=_agentic_cfg.get("model", "gpt-4o-mini"),
+            tavily_key=get_settings().TAVILY_API_KEY,
+            max_iterations=int(_agentic_cfg.get("agent_max_iterations", 8)),
+        )
         self.agentic_strategy = AgenticSearchStrategy(self.opensearch, tool_service)
         
         logger.info("search_orchestrator_initialized")
@@ -409,7 +415,10 @@ class SearchOrchestrator:
         
         if include_reasoning and result.matching_reason:
             formatted["matching_reason"] = result.matching_reason
-        
+
+        if result.event_data:
+            formatted["event_data"] = result.event_data.model_dump()
+
         return formatted
     
     def _get_search_logic_header(self, intent: QueryIntent) -> str:

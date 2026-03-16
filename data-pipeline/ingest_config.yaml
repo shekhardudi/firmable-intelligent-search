@@ -1,12 +1,12 @@
-index_name: companies-new
+index_name: companies
 
 chunk_size: 10000
 embedding_batch_size: 512
 bulk_chunk_size: 500
 
 embedding:
-  model: BAAI/bge-base-en-v1.5
-  dimension: 768
+  model: all-MiniLM-L6-v2
+  dimension: 384
 
 vector_index:
   space_type: cosinesimil
