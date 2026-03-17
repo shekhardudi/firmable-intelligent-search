@@ -54,10 +54,10 @@ async def lifespan(app: FastAPI):
     )
 
     # Configure OTel tracing + metrics (non-fatal on any import/config error)
-    from app.observability import configure_tracing, configure_metrics, instrument_fastapi
+    from app.observability import configure_tracing, configure_metrics, configure_log_export
     configure_tracing(settings.OTEL_SERVICE_NAME, settings.OTLP_ENDPOINT)
     configure_metrics(settings.OTEL_SERVICE_NAME, settings.OTLP_ENDPOINT)
-    instrument_fastapi(app)
+    configure_log_export(settings.OTEL_SERVICE_NAME, settings.OTLP_ENDPOINT, settings.LOG_LEVEL)
     
     # Initialize and test OpenSearch connection
     try:
@@ -83,6 +83,7 @@ async def lifespan(app: FastAPI):
     try:
         from app.services.embedding_service import get_embedding_service
         embeddings = get_embedding_service()
+        _ = embeddings.model  # Eagerly load SentenceTransformer weights at startup
         logger.info(
             "embedding_service_initialized",
             embedding_dimension=embeddings.get_embedding_dimension(),
@@ -91,6 +92,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("embedding_service_initialization_failed", error=str(e))
     
+    # Initialize Cache Service
+    try:
+        from app.services.cache_service import get_cache_service
+        cache = get_cache_service()
+        logger.info("cache_service_initialized", redis_available=cache.is_available)
+    except Exception as e:
+        logger.warning("cache_service_initialization_failed", error=str(e))
+
     # Initialize Search Orchestrator
     try:
         from app.services.orchestrator import get_search_orchestrator
@@ -210,6 +219,10 @@ def get_application() -> FastAPI:
         response.headers["X-Process-Time-MS"] = str(int(process_time))
         return response
     
+    # OTel FastAPI instrumentation — must happen before the app starts serving
+    from app.observability import instrument_fastapi
+    instrument_fastapi(app)
+
     # Include routes
     app.include_router(routes.router)
     
@@ -230,6 +243,11 @@ def get_application() -> FastAPI:
             }
         )
     
+    @app.get("/health", tags=["diagnostics"])
+    async def health():
+        """Lightweight health check for ALB/container probes"""
+        return {"status": "healthy"}
+
     @app.get("/", tags=["root"])
     async def root():
         """API root endpoint with metadata"""
@@ -239,7 +257,7 @@ def get_application() -> FastAPI:
             "version": settings.API_VERSION,
             "environment": settings.ENVIRONMENT,
             "docs_url": "/docs",
-            "health_check": "/api/search/health",
+            "health_check": "/health",
             "features_info": "/api/search/features"
         }
     

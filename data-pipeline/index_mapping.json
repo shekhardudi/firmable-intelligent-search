@@ -111,11 +111,17 @@
         "dimension": 384,
         "method": {
           "name": "hnsw",
-          "space_type": "cosinesimil",
+          "space_type": "innerproduct",
           "engine": "faiss",
           "parameters": {
             "m": 16,
-            "ef_construction": 128
+            "ef_construction": 128,
+            "encoder": {
+              "name": "sq",
+              "parameters": {
+                "type": "fp16"
+              }
+            }
           }
         }
       }

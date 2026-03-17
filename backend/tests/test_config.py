@@ -54,3 +54,19 @@ def test_get_search_config_missing_file(monkeypatch, tmp_path):
         cfg.get_search_config()
     cfg.get_settings.cache_clear()
     cfg.get_search_config.cache_clear()
+
+
+def test_get_search_config_has_semantic_mode(settings_override):
+    from app.config import get_search_config
+    cfg = get_search_config()
+    assert "semantic" in cfg
+    assert "mode" in cfg["semantic"]
+    assert cfg["semantic"]["mode"] in ("knn", "rrf")
+
+
+def test_get_search_config_has_popularity_boost(settings_override):
+    from app.config import get_search_config
+    cfg = get_search_config()
+    boosts = cfg.get("field_boosts", {}).get("bm25_regular", {})
+    assert "popularity_boost_factor" in boosts
+    assert float(boosts["popularity_boost_factor"]) >= 0

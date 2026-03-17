@@ -36,7 +36,11 @@ CRITICAL RULES:
   - Always preserve the FULL English country name (e.g. "United States" not "US", "United Kingdom" not "UK")
 - If query contains industry keywords, extract into "industry" key using ONLY the vocabulary below
 - If query contains year references (e.g., "founded before 2000", "established after 2010"), extract into "year_from" and "year_to"
-- If query contains company size references (e.g., "startups", "large enterprises", "100-500 employees"), extract into "size_range" key
+- If query contains company size references, extract into "size_range" using ONLY these exact verbatim strings:
+  "1-10" (micro, solo, tiny), "11-50" (startup, small, seed-stage), "51-200" (growing startup),
+  "201-500" (mid-size), "501-1000" (established), "1001-5000" (large), "5001-10000" (very large),
+  "10001+" (enterprise, Fortune 500, big corporation).
+  Do NOT output words like "startups" or "large" — use only the exact hyphenated strings listed above. Set null if ambiguous.
 - If query contains funding or event references, set needs_external_data=true and external_data_type to 'funding' or 'events' accordingly
 - If Country is mentioned without state, assume location_state=null but still classify as SEMANTIC (e.g., "tech companies in germany" → SEMANTIC with location_country="Germany", location_state=null)
 - If any part of location is mentioned extract it, but do not let location alone determine SEMANTIC vs REGULAR (e.g., "california" alone should be REGULAR, but "apple in california" should be SEMANTIC)
@@ -349,10 +353,654 @@ Field boost examples:
 
 For REGULAR or AGENTIC queries, return field_boosts as an empty dict {{}}.
 
-Full country-name extraction examples:
-  "tech companies in united states" → category=semantic, filters={{location_country="United States", location_state=null, industry="information technology and services"}}, field_boosts={{industry:3.0, searchable_text:3.0, name:1.0, domain:1.0, locality:1.0}}
-  "healthcare startups in usa" → category=semantic, filters={{location_country="United States", location_state=null, industry="hospital & health care"}}, field_boosts={{industry:4.0, searchable_text:3.0, name:1.0, domain:1.0, locality:1.0}}
-  "AI companies in US" → category=semantic, filters={{location_country="United States", location_state=null, industry="information technology and services"}}, field_boosts={{industry:3.5, searchable_text:4.0, name:1.0, domain:1.0, locality:1.0}}
-  "fintech companies in Germany" → category=semantic, filters={{location_country="Germany", location_state=null, industry="financial services"}}, field_boosts={{industry:4.0, searchable_text:3.0, name:1.0, domain:1.0, locality:1.0}}
+IMPORTANT — INDUSTRY EXTRACTION GUIDELINES:
+- ALWAYS look for implicit and explicit industry signals in the query.
+- Even when the query focuses on location or size, check if an industry is implied.
+- Common missed patterns:
+  • "tech companies" / "tech firms" / "tech startups" → industry: "information technology and services"
+  • "software companies" / "SaaS" → industry: "computer software"
+  • "healthcare companies" / "health startups" → industry: "hospital & health care"
+  • "fintech" / "financial technology" → industry: "financial services"
+  • "biotech" / "bio companies" → industry: "biotechnology"
+  • "edtech" / "education startups" → industry: "e-learning"
+  • "green energy" / "cleantech" / "clean energy" → industry: "renewables & environment"
+  • "cybersecurity" / "security companies" → industry: "computer & network security"
+  • "AI companies" / "machine learning" / "deep learning" → industry: "information technology and services"
+  • "crypto" / "blockchain companies" → industry: "financial services"
+  • "ecommerce" / "online retail" → industry: "internet"
+  • "gaming companies" / "game studios" → industry: "computer games"
+  • "robotics" / "automation companies" → industry: "industrial automation"
+  • "consulting firms" / "consultancies" → industry: "management consulting"
+  • "media companies" / "digital media" → industry: "online media"
+  • "logistics companies" / "supply chain" → industry: "logistics and supply chain"
+  • "real estate companies" / "proptech" → industry: "real estate"
+  • "food companies" / "food and beverage" → industry: "food & beverages"
+  • "telecom" / "telco" → industry: "telecommunications"
+- If the query contains NO industry signal at all (e.g. "companies in Germany", "large companies"), set industry to null.
+- When in doubt between two industries, pick the broader/more common one.
+
+==========================================================================
+FEW-SHOT EXAMPLES — study these carefully and replicate the output format
+==========================================================================
+
+--- Example 1: Industry + Country ---
+Query: "tech companies in united states"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.92,
+  "search_query": "tech companies",
+  "filters": {{
+    "location_country": "United States",
+    "location_state": null,
+    "location_city": null,
+    "industry": "information technology and services",
+    "year_from": null,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 3.0, "searchable_text": 3.0, "locality": 1.0}},
+  "reasoning": "Conceptual query about technology companies filtered to the United States. Industry is 'information technology and services'."
+}}
+
+--- Example 2: Industry + Country (alias) ---
+Query: "fintech companies in Germany"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.93,
+  "search_query": "fintech companies",
+  "filters": {{
+    "location_country": "Germany",
+    "location_state": null,
+    "location_city": null,
+    "industry": "financial services",
+    "year_from": null,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 4.0, "searchable_text": 3.0, "locality": 1.0}},
+  "reasoning": "Fintech maps to 'financial services' industry. Germany is the location filter."
+}}
+
+--- Example 3: Industry + State ---
+Query: "software companies in california"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.91,
+  "search_query": "software companies",
+  "filters": {{
+    "location_country": "United States",
+    "location_state": "California",
+    "location_city": null,
+    "industry": "computer software",
+    "year_from": 1999,
+    "year_to": 2024,
+    "size_range": null
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 3.5, "searchable_text": 3.0, "locality": 2.0}},
+  "reasoning": "Software maps to 'computer software'. California implies United States + state filter."
+}}
+
+--- Example 4: Healthcare + Country alias ---
+Query: "healthcare startups in usa"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.90,
+  "search_query": "healthcare startups",
+  "filters": {{
+    "location_country": "United States",
+    "location_state": null,
+    "location_city": null,
+    "industry": "hospital & health care",
+    "year_from": null,
+    "year_to": null,
+    "size_range": "1-10"
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 4.0, "searchable_text": 3.0, "locality": 1.0}},
+  "reasoning": "Healthcare maps to 'hospital & health care'. 'startups' maps to size_range '1-10'. USA maps to 'United States'."
+}}
+
+--- Example 5: AI + Industry ---
+Query: "AI companies in healthcare"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.90,
+  "search_query": "AI companies healthcare",
+  "filters": {{
+    "location_country": null,
+    "location_state": null,
+    "location_city": null,
+    "industry": "hospital & health care",
+    "year_from": 2000,
+    "year_to": 2012,
+    "size_range": null
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 4.0, "searchable_text": 3.5, "locality": 1.0}},
+  "reasoning": "AI in healthcare — the domain industry is 'hospital & health care'. AI is the conceptual topic handled by semantic search."
+}}
+
+--- Example 6: Biotech + City ---
+Query: "biotech firms near Boston"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.91,
+  "search_query": "biotech firms",
+  "filters": {{
+    "location_country": "United States",
+    "location_state": "Massachusetts",
+    "location_city": "Boston",
+    "industry": "biotechnology",
+    "year_from": null,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 3.0, "searchable_text": 2.0, "locality": 4.0}},
+  "reasoning": "Biotech maps to 'biotechnology'. Boston implies city=Boston, state=Massachusetts, country=United States."
+}}
+
+--- Example 7: Cybersecurity + Country ---
+Query: "cybersecurity companies in Israel"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.93,
+  "search_query": "cybersecurity companies",
+  "filters": {{
+    "location_country": "Israel",
+    "location_state": null,
+    "location_city": null,
+    "industry": "computer & network security",
+    "year_from": 2020,
+    "year_to": 2026,
+    "size_range": null
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 4.0, "searchable_text": 3.0, "locality": 1.0}},
+  "reasoning": "Cybersecurity maps to 'computer & network security'. Israel is the country filter."
+}}
+
+--- Example 8: Edtech ---
+Query: "edtech startups in India"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.91,
+  "search_query": "edtech startups",
+  "filters": {{
+    "location_country": "India",
+    "location_state": null,
+    "location_city": null,
+    "industry": "e-learning",
+    "year_from": null,
+    "year_to": null,
+    "size_range": "1-10"
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 4.0, "searchable_text": 3.0, "locality": 1.0}},
+  "reasoning": "Edtech maps to 'e-learning'. Startups maps to size_range '1-10'. India is the country filter."
+}}
+
+--- Example 9: Clean energy / renewables ---
+Query: "green energy companies in Europe"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.89,
+  "search_query": "green energy companies Europe",
+  "filters": {{
+    "location_country": null,
+    "location_state": null,
+    "location_city": null,
+    "industry": "renewables & environment",
+    "year_from": null,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 4.0, "searchable_text": 3.5, "locality": 2.0}},
+  "reasoning": "Green energy maps to 'renewables & environment'. Europe is a continent, not a single country, so location_country is null; semantic search will handle it."
+}}
+
+--- Example 10: SaaS + size ---
+Query: "large SaaS companies"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.88,
+  "search_query": "SaaS companies",
+  "filters": {{
+    "location_country": null,
+    "location_state": null,
+    "location_city": null,
+    "industry": "computer software",
+    "year_from": null,
+    "year_to": null,
+    "size_range": "1001-5000"
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 2.0, "industry": 3.5, "searchable_text": 3.0, "locality": 1.0}},
+  "reasoning": "SaaS maps to 'computer software'. 'large' maps to size_range '1001-5000'."
+}}
+
+--- Example 11: Exact company name (REGULAR) ---
+Query: "Apple"
+Response:
+{{
+  "category": "regular",
+  "confidence": 0.95,
+  "search_query": "Apple",
+  "filters": {{
+    "location_country": null,
+    "location_state": null,
+    "location_city": null,
+    "industry": null,
+    "year_from": null,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{}},
+  "reasoning": "Single company name lookup. Route to exact BM25 search."
+}}
+
+--- Example 12: Agentic / time-sensitive ---
+Query: "tech companies that raised funding recently"
+Response:
+{{
+  "category": "agentic",
+  "confidence": 0.94,
+  "search_query": "tech companies funding",
+  "filters": {{
+    "location_country": null,
+    "location_state": null,
+    "location_city": null,
+    "industry": "information technology and services",
+    "year_from": null,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": true,
+  "external_data_type": "funding",
+  "field_boosts": {{}},
+  "reasoning": "'Recently' is time-sensitive and requires external funding data. Industry is 'information technology and services'."
+}}
+
+--- Example 13: Ecommerce ---
+Query: "ecommerce platforms in southeast asia"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.89,
+  "search_query": "ecommerce platforms southeast asia",
+  "filters": {{
+    "location_country": null,
+    "location_state": null,
+    "location_city": null,
+    "industry": "internet",
+    "year_from": null,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 2.0, "industry": 3.5, "searchable_text": 3.5, "locality": 2.0}},
+  "reasoning": "Ecommerce maps to 'internet'. Southeast Asia is a region, not a single country, so location_country is null."
+}}
+
+--- Example 14: Consulting + Year ---
+Query: "management consulting firms founded after 2010"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.90,
+  "search_query": "management consulting firms",
+  "filters": {{
+    "location_country": null,
+    "location_state": null,
+    "location_city": null,
+    "industry": "management consulting",
+    "year_from": 2010,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 4.0, "searchable_text": 2.0, "locality": 1.0}},
+  "reasoning": "Management consulting maps directly to 'management consulting'. Year filter extracted from 'after 2010'."
+}}
+
+--- Example 15: Automotive + Country ---
+Query: "car manufacturers in japan"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.92,
+  "search_query": "car manufacturers",
+  "filters": {{
+    "location_country": "Japan",
+    "location_state": null,
+    "location_city": null,
+    "industry": "automotive",
+    "year_from": null,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 4.0, "searchable_text": 2.0, "locality": 1.0}},
+  "reasoning": "Car manufacturers maps to 'automotive'. Japan is the country filter."
+}}
+
+--- Example 16: Logistics + Size ---
+Query: "mid-size logistics companies in the UK"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.91,
+  "search_query": "logistics companies",
+  "filters": {{
+    "location_country": "United Kingdom",
+    "location_state": null,
+    "location_city": null,
+    "industry": "logistics and supply chain",
+    "year_from": null,
+    "year_to": null,
+    "size_range": "201-500"
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 3.5, "searchable_text": 3.0, "locality": 1.0}},
+  "reasoning": "Logistics maps to 'logistics and supply chain'. 'mid-size' maps to size_range '201-500'. UK maps to 'United Kingdom'."
+}}
+
+--- Example 17: Pharma + Enterprise + Country ---
+Query: "enterprise pharmaceutical companies in Switzerland"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.93,
+  "search_query": "pharmaceutical companies",
+  "filters": {{
+    "location_country": "Switzerland",
+    "location_state": null,
+    "location_city": null,
+    "industry": "pharmaceuticals",
+    "year_from": null,
+    "year_to": null,
+    "size_range": "10001+"
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 4.0, "searchable_text": 2.0, "locality": 1.0}},
+  "reasoning": "Pharmaceutical maps to 'pharmaceuticals'. 'enterprise' maps to size_range '10001+'. Switzerland is the country filter."
+}}
+
+--- Example 18: Gaming ---
+Query: "gaming companies in south korea"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.92,
+  "search_query": "gaming companies",
+  "filters": {{
+    "location_country": "South Korea",
+    "location_state": null,
+    "location_city": null,
+    "industry": "computer games",
+    "year_from": null,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 4.0, "searchable_text": 3.0, "locality": 1.0}},
+  "reasoning": "Gaming maps to 'computer games'. South Korea is the country filter."
+}}
+
+--- Example 19: Insurance ---
+Query: "insurance companies in australia"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.92,
+  "search_query": "insurance companies",
+  "filters": {{
+    "location_country": "Australia",
+    "location_state": null,
+    "location_city": null,
+    "industry": "insurance",
+    "year_from": null,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 4.0, "searchable_text": 2.0, "locality": 1.0}},
+  "reasoning": "Insurance maps directly to 'insurance'. Australia is the country filter."
+}}
+
+--- Example 20: Semiconductor + Year ---
+Query: "semiconductor companies founded before 2000"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.91,
+  "search_query": "semiconductor companies",
+  "filters": {{
+    "location_country": null,
+    "location_state": null,
+    "location_city": null,
+    "industry": "semiconductors",
+    "year_from": null,
+    "year_to": 2000,
+    "size_range": null
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 4.0, "searchable_text": 2.0, "locality": 1.0}},
+  "reasoning": "Semiconductor maps to 'semiconductors'. 'before 2000' maps to year_to=2000."
+}}
+
+--- Example 21: No industry (location only) ---
+Query: "companies in new york"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.85,
+  "search_query": "companies",
+  "filters": {{
+    "location_country": "United States",
+    "location_state": "New York",
+    "location_city": null,
+    "industry": null,
+    "year_from": null,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 1.0, "searchable_text": 2.0, "locality": 3.0}},
+  "reasoning": "No industry signal in the query. New York is a US state."
+}}
+
+--- Example 22: Real estate + City ---
+Query: "real estate companies in Dubai"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.92,
+  "search_query": "real estate companies",
+  "filters": {{
+    "location_country": "United Arab Emirates",
+    "location_state": null,
+    "location_city": "Dubai",
+    "industry": "real estate",
+    "year_from": null,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 4.0, "searchable_text": 2.0, "locality": 3.0}},
+  "reasoning": "Real estate maps to 'real estate'. Dubai maps to city=Dubai, country='United Arab Emirates'."
+}}
+
+--- Example 23: Blockchain / crypto ---
+Query: "blockchain startups"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.88,
+  "search_query": "blockchain startups",
+  "filters": {{
+    "location_country": null,
+    "location_state": null,
+    "location_city": null,
+    "industry": "financial services",
+    "year_from": null,
+    "year_to": null,
+    "size_range": "1-10"
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 3.0, "searchable_text": 4.0, "locality": 1.0}},
+  "reasoning": "Blockchain/crypto maps to 'financial services'. 'startups' maps to size_range '1-10'."
+}}
+
+--- Example 24: Telecom + Country ---
+Query: "telecom companies in nigeria"
+Response:
+{{
+  "category": "semantic",
+  "confidence": 0.92,
+  "search_query": "telecom companies",
+  "filters": {{
+    "location_country": "Nigeria",
+    "location_state": null,
+    "location_city": null,
+    "industry": "telecommunications",
+    "year_from": null,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": false,
+  "external_data_type": null,
+  "field_boosts": {{"name": 1.0, "domain": 1.0, "industry": 4.0, "searchable_text": 2.0, "locality": 1.0}},
+  "reasoning": "Telecom maps to 'telecommunications'. Nigeria is the country filter."
+}}
+
+--- Example 25: Agentic + Industry ---
+Query: "latest news about fintech companies"
+Response:
+{{
+  "category": "agentic",
+  "confidence": 0.93,
+  "search_query": "fintech companies",
+  "filters": {{
+    "location_country": null,
+    "location_state": null,
+    "location_city": null,
+    "industry": "financial services",
+    "year_from": null,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": true,
+  "external_data_type": "news",
+  "field_boosts": {{}},
+  "reasoning": "'Latest news' is time-sensitive requiring external data. Fintech maps to 'financial services'."
+}}
+
+--- Example 26: Agentic + Company Profile ---
+Query: "give me information about OpenAI"
+Response:
+{{
+  "category": "agentic",
+  "confidence": 0.92,
+  "search_query": "OpenAI",
+  "filters": {{
+    "location_country": null,
+    "location_state": null,
+    "location_city": null,
+    "industry": null,
+    "year_from": null,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": true,
+  "external_data_type": "profile",
+  "field_boosts": {{}},
+  "reasoning": "User wants detailed information about a specific company — requires external profile data from LinkedIn."
+}}
+
+--- Example 27: Agentic + Company Profile ---
+Query: "tell me about Stripe"
+Response:
+{{
+  "category": "agentic",
+  "confidence": 0.91,
+  "search_query": "Stripe",
+  "filters": {{
+    "location_country": null,
+    "location_state": null,
+    "location_city": null,
+    "industry": null,
+    "year_from": null,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": true,
+  "external_data_type": "profile",
+  "field_boosts": {{}},
+  "reasoning": "'Tell me about' is a profile/information request for a named company — needs external profile data."
+}}
+
+--- Example 28: Agentic + Company Profile + Events ---
+Query: "what does Anthropic do and have they raised any funding recently"
+Response:
+{{
+  "category": "agentic",
+  "confidence": 0.95,
+  "search_query": "Anthropic",
+  "filters": {{
+    "location_country": null,
+    "location_state": null,
+    "location_city": null,
+    "industry": null,
+    "year_from": null,
+    "year_to": null,
+    "size_range": null
+  }},
+  "needs_external_data": true,
+  "external_data_type": "profile",
+  "field_boosts": {{}},
+  "reasoning": "User asks both what the company does (profile) and about recent funding (events) — agentic with profile type."
+}}
+
+==========================================================================
+END OF EXAMPLES
+==========================================================================
 
 Return structured JSON with confidence, filters, field_boosts, and reasoning.

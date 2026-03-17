@@ -6,6 +6,7 @@ import structlog
 import time
 from functools import lru_cache
 from typing import Dict, List, Any, Optional
+from app.services.cache_service import get_cache_service
 from app.services.opensearch_service import get_opensearch_service
 from app.models.search import (
     BasicSearchRequest, BasicSearchResponse, CompanySearchResult,
@@ -22,6 +23,7 @@ class SearchService:
     def __init__(self):
         self.settings = get_settings()
         self.opensearch = get_opensearch_service()
+        self.cache = get_cache_service()
         self.index_name = self.settings.OPENSEARCH_INDEX_NAME
     
     # ========================================================================
@@ -33,6 +35,30 @@ class SearchService:
         Perform structured company search with filters.
         Fast path using OpenSearch only.
         """
+        # Cache lookup
+        _cache_key = self.cache.make_key(
+            "basic",
+            {
+                "q": request.q,
+                "page": request.page,
+                "limit": request.limit,
+                "industry": sorted(request.industry or []),
+                "country": request.country,
+                "locality": request.locality,
+                "year_from": request.year_from,
+                "year_to": request.year_to,
+                "size": sorted(request.size or []),
+                "sort": request.sort.value if request.sort else None,
+            },
+        )
+        if self.settings.ENABLE_CACHING:
+            _cached = self.cache.get(_cache_key)
+            if _cached:
+                try:
+                    return BasicSearchResponse.model_validate_json(_cached)
+                except Exception:
+                    pass  # Corrupt entry — fall through
+
         start_time = time.time()
         
         try:
@@ -63,7 +89,7 @@ class SearchService:
                        results_returned=len(results),
                        time_ms=search_time_ms)
             
-            return BasicSearchResponse(
+            result = BasicSearchResponse(
                 total=response["hits"]["total"].get("value", 0),
                 page=request.page,
                 limit=request.limit,
@@ -71,6 +97,11 @@ class SearchService:
                 facets=facets,
                 search_time_ms=search_time_ms
             )
+
+            if self.settings.ENABLE_CACHING:
+                self.cache.set(_cache_key, result.model_dump_json())
+
+            return result
             
         except Exception as e:
             logger.error("basic_search_failed", error=str(e))

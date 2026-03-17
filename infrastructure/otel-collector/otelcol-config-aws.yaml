@@ -1,0 +1,107 @@
+# OpenTelemetry Collector configuration for Firmable on AWS ECS.
+#
+# This file is used when you need custom attribute enrichment or metric
+# filtering beyond what the ADOT default config provides.
+#
+# For standard demos, the AWS-managed default config is sufficient:
+#   --config /etc/ecs/ecs-default-config.yaml
+#
+# To use this custom config instead, mount it into the ADOT sidecar container
+# and pass: --config /etc/otelcol/otelcol-config-aws.yaml
+#
+# Data flow (AWS):
+#   App (OTLP/gRPC localhost:4317)
+#     → receivers/otlp
+#     → processors/batch + resourcedetection + attributes/sanitize
+#     → exporters/awsxray (traces)
+#     → exporters/awsemf  (metrics → CloudWatch EMF)
+#
+# Note: Logs are sent directly via the ECS awslogs log driver — not through
+# this collector. No logs pipeline is needed here.
+
+extensions:
+  health_check:
+    endpoint: "0.0.0.0:13133"
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+  # Auto-detect ECS task metadata and enrich spans/metrics with:
+  # aws.ecs.cluster, aws.ecs.task.family, aws.ecs.task.revision, cloud.region
+  resourcedetection:
+    detectors: [env, ecs, ec2]
+    timeout: 5s
+    override: false
+
+  # Drop high-cardinality attributes that bloat CloudWatch metrics
+  attributes/sanitize:
+    actions:
+      - key: net.peer.ip
+        action: delete
+      - key: http.user_agent
+        action: delete
+      - key: db.statement
+        action: delete
+
+exporters:
+  # Traces → AWS X-Ray
+  # The ADOT distribution includes the awsxray exporter by default.
+  awsxray:
+    region: "${AWS_REGION}"
+    # Indexed attributes become X-Ray annotations (searchable)
+    indexed_attributes:
+      - search.mode
+      - search.query_length
+      - intent.type
+
+  # Metrics → CloudWatch via Embedded Metric Format
+  awsemf:
+    region: "${AWS_REGION}"
+    namespace: "Firmable/Search"
+    log_group_name: "/ecs/firmable-search/metrics"
+    log_stream_name: "${HOSTNAME}"
+    # Map OTel instrument types to CloudWatch metric units
+    metric_declarations:
+      - dimensions: [["search.mode"], ["service.name"]]
+        metric_name_selectors:
+          - "firmable.search.latency"
+          - "firmable.search.total"
+          - "firmable.search.errors"
+      - dimensions: [["service.name"]]
+        metric_name_selectors:
+          - "firmable.embedding.*"
+          - "firmable.cache.*"
+
+  # Structured debug logs to CloudWatch (collector self-diagnostics)
+  debug:
+    verbosity: normal
+
+service:
+  extensions: [health_check]
+
+  telemetry:
+    logs:
+      level: "warn"    # Suppress info-level collector logs in production
+    metrics:
+      address: ":8889"
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [resourcedetection, batch]
+      exporters: [awsxray]
+
+    metrics:
+      receivers: [otlp]
+      processors: [resourcedetection, batch, attributes/sanitize]
+      exporters: [awsemf]

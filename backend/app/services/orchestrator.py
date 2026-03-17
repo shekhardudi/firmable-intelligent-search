@@ -15,6 +15,7 @@ from app.config import get_settings, get_search_config
 from app.services.intent_classifier import get_intent_classifier, SearchIntent, QueryIntent
 from app.services.embedding_service import get_embedding_service
 from app.services.opensearch_service import get_opensearch_service
+from app.services.cache_service import get_cache_service
 from app.services.tool_service import ToolService
 from app.services.search_strategies import (
     SearchContext, SearchResult, RegularSearchStrategy,
@@ -48,16 +49,32 @@ _COMPANY_SUFFIX_RE = re.compile(
 
 # Signals that disqualify regex-REGULAR → must go to LLM
 _SEMANTIC_DISQUALIFY_RE = re.compile(
+    # Question / conceptual words
     r'\b(who|what|where|how|which|why|like|similar|comparable|'
     r'type\s+of|kind\s+of|innovative|leading|top|best|fastest?|'
     r'largest?|biggest?|growing|focused\s+on|specializ|dealing\s+in|'
-    r'providing|offering|that\s+(do|make|sell|build|offer|provide|work))\b',
+    r'providing|offering|that\s+(do|make|sell|build|offer|provide|work)|'
+    # Conversational / imperative phrasing
+    r'find\s+me|show\s+me|tell\s+me|give\s+me|get\s+me|help\s+me|'
+    r'look\s*up|search\s+for|looking\s+for|know\s+about|'
+    r'i\s+want|i\s+need|can\s+you|could\s+you|please|'
+    # Information-seeking intent
+    r'about|info|information|details?|overview|summary|describe|explain|'
+    # Comparison / alternatives
+    r'compare|versus|vs\.?|between|differ|alternatives?|competitors?|rivals?|'
+    # Multi-entity / list requests
+    r'list\s+of|list\s+all|list\s+me|companies\s+(?:like|similar|in|that|with)|'
+    r'startups?\s+(?:like|similar|in|that|with)|'
+    r'firms?\s+(?:like|similar|in|that|with))\b',
     re.IGNORECASE,
 )
 
 _AGENTIC_DISQUALIFY_RE = re.compile(
     r'\b(funded|funding|raised|series\s+[abcde]|ipo|acquired|acquisition|'
-    r'merger|revenue|valuation|unicorn|investors?|news|recent|latest|announced)\b',
+    r'merger|revenue|valuation|unicorn|investors?|news|recent|latest|announced|'
+    r'hired|hiring|layoff|laid\s+off|launched|partnership|expanded|'
+    r'this\s+year|last\s+year|this\s+quarter|this\s+month|'
+    r'20[12][0-9]|currently|trending)\b',
     re.IGNORECASE,
 )
 
@@ -96,6 +113,7 @@ class SearchOrchestrator:
         self.classifier = get_intent_classifier()
         self.embeddings = get_embedding_service()
         self.opensearch = get_opensearch_service()
+        self.cache = get_cache_service()
         
         # Initialize search strategies
         self.regular_strategy = RegularSearchStrategy(self.opensearch)
@@ -136,6 +154,28 @@ class SearchOrchestrator:
         Returns:
             IntelligentSearchResponse with results and metadata
         """
+        # Cache lookup — check before generating trace_id for cleaner early returns
+        _cache_key = self.cache.make_key(
+            "intel",
+            {
+                "q": query.strip().lower(),
+                "limit": limit,
+                "page": page,
+                "filters": user_filters or {},
+            },
+        )
+        if self.settings.ENABLE_CACHING:
+            _cached = self.cache.get(_cache_key)
+            if _cached:
+                try:
+                    cached_resp = IntelligentSearchResponse.model_validate_json(_cached)
+                    cached_resp.metadata["cached"] = True
+                    self.cache.track_query(query)
+                    logger.info("intelligent_search_cache_hit", query=query[:100])
+                    return cached_resp
+                except Exception:
+                    pass  # Corrupt/stale entry — fall through to live search
+
         trace_id = trace_id or generate_trace_id()
         start_time = time.time()
         
@@ -154,7 +194,24 @@ class SearchOrchestrator:
             intent = self._regex_classify(query)
             classified_by_regex = intent is not None
             if intent is None:
-                intent = self.classifier.classify(query, trace_id)
+                try:
+                    intent = self.classifier.classify(query, trace_id)
+                except Exception as clf_err:
+                    logger.warning(
+                        "classification_failed_fallback_to_semantic",
+                        trace_id=trace_id,
+                        query=query[:100],
+                        error=str(clf_err),
+                    )
+                    intent = QueryIntent(
+                        category=SearchIntent.SEMANTIC,
+                        confidence=0.5,
+                        filters={},
+                        search_query=query,
+                        needs_external_data=False,
+                        field_boosts={},
+                        reasoning="Classification failed; falling back to semantic search",
+                    )
 
             logger.info(
                 "query_intent_determined",
@@ -232,7 +289,7 @@ class SearchOrchestrator:
                 response_time_ms=response_time_ms
             )
             
-            return IntelligentSearchResponse(
+            response = IntelligentSearchResponse(
                 query=query,
                 trace_id=trace_id,
                 intent=intent.model_dump(),
@@ -240,6 +297,13 @@ class SearchOrchestrator:
                 metadata=metadata,
                 response_headers=response_headers
             )
+
+            # Cache result (skip AGENTIC — time-sensitive external data)
+            if self.settings.ENABLE_CACHING and intent.category != SearchIntent.AGENTIC:
+                self.cache.set(_cache_key, response.model_dump_json())
+            self.cache.track_query(query)
+
+            return response
         
         except Exception as e:
             logger.error(
@@ -272,11 +336,20 @@ class SearchOrchestrator:
         if _SEMANTIC_DISQUALIFY_RE.search(q) or _AGENTIC_DISQUALIFY_RE.search(q):
             return None
 
-        is_regular = (
-            bool(_QUOTED_RE.match(q))
-            or bool(_DOMAIN_RE.match(q))
-            or bool(_COMPANY_SUFFIX_RE.search(q))
-        )
+        is_quoted = bool(_QUOTED_RE.match(q))
+        is_domain = bool(_DOMAIN_RE.match(q))
+        has_suffix = bool(_COMPANY_SUFFIX_RE.search(q))
+
+        # Quoted phrases and domains are always REGULAR
+        is_regular = is_quoted or is_domain
+
+        # For suffix matches, apply word-count guard: real company names
+        # are short (1-5 words). Longer queries are conversational even if
+        # they contain "Inc" or "Ltd" — defer to LLM.
+        if not is_regular and has_suffix:
+            core = _LOCATION_SUFFIX_RE.sub('', q).strip()
+            is_regular = len(core.split()) <= 5
+
         if not is_regular:
             return None
 
@@ -418,6 +491,9 @@ class SearchOrchestrator:
 
         if result.event_data:
             formatted["event_data"] = result.event_data.model_dump()
+
+        if result.linkedin_profile:
+            formatted["linkedin_profile"] = result.linkedin_profile
 
         return formatted
     

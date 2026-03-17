@@ -6,11 +6,10 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     build-essential \
     gcc \
-    libpq-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements
+# Copy requirements and install
 COPY requirements.txt .
 
 # 1. Install CPU-only PyTorch (~200 MB vs ~2 GB for CUDA version)
@@ -22,16 +21,12 @@ RUN pip install --no-cache-dir \
 #    already satisfied.  Works because requirements.txt has no torch pin.
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy pipeline code and data files
 COPY . .
 
 # Create non-root user
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/api/search/health || exit 1
-
-# Run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["python", "data_ingestion_pipeline.py"]
+CMD ["--reset"]

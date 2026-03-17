@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -160,8 +161,18 @@ def read_chunks(
     if not path.exists():
         raise FileNotFoundError(f"CSV not found: {file_path}")
 
+    _COLUMN_RENAME = {
+        "year founded": "year_founded",
+        "size range": "size_range",
+        "linkedin url": "linkedin_url",
+        "current employee estimate": "current_employee_estimate",
+        "total employee estimate": "total_employee_estimate",
+    }
+
     logger.info("stage1_read_started", path=file_path, chunk_size=chunk_size)
-    yield from pd.read_csv(path, chunksize=chunk_size)
+    for chunk in pd.read_csv(path, chunksize=chunk_size):
+        chunk.rename(columns=_COLUMN_RENAME, inplace=True)
+        yield chunk
 
 
 # ===========================================================================
@@ -215,7 +226,7 @@ def _parse_locality(locality: str) -> tuple[str, str]:
     """
     parts = [p.strip().lower() for p in str(locality or "").split(",") if p.strip()]
     city = parts[0] if parts else ""
-    state = parts[-1] if len(parts) > 1 else ""
+    state = parts[1] if len(parts) > 1 else ""
     return city, state
 
 
@@ -632,13 +643,14 @@ def run_pipeline(
 def create_opensearch_client(
     host: str = "localhost",
     port: int = 9200,
-    user: str = "admin",
+    user: str = "",
     password: str = "",
 ) -> OpenSearch:
     """
     Create and return a configured OpenSearch client.
-    Password defaults to the OPENSEARCH_PASSWORD environment variable.
+    User and password default to OPENSEARCH_USER / OPENSEARCH_PASSWORD env vars.
     """
+    user = user or os.getenv("OPENSEARCH_USER", "admin")
     password = password or os.getenv("OPENSEARCH_PASSWORD", "")
     client = OpenSearch(
         hosts=[{"host": host, "port": port}],
@@ -680,6 +692,44 @@ def load_embedding_model(model_path: str = CONFIG.model_path) -> SentenceTransfo
 
 
 # ===========================================================================
+# S3 DOWNLOAD HELPER
+# ===========================================================================
+
+def download_from_s3(s3_uri: str, dest_dir: str) -> str:
+    """
+    Download an S3 object to a local file and return the local path.
+
+    Parameters
+    ----------
+    s3_uri   : URI in the form ``s3://bucket/key``.
+    dest_dir : local directory to write the file into.
+
+    Returns
+    -------
+    str — absolute path to the downloaded file.
+    """
+    import boto3
+
+    if not s3_uri.startswith("s3://"):
+        raise ValueError(f"Invalid S3 URI: {s3_uri}")
+
+    without_scheme = s3_uri[len("s3://"):]
+    bucket, _, key = without_scheme.partition("/")
+    if not key:
+        raise ValueError(f"S3 URI missing key: {s3_uri}")
+
+    filename = Path(key).name
+    local_path = os.path.join(dest_dir, filename)
+
+    logger.info("s3_download_started", bucket=bucket, key=key, dest=local_path)
+    s3 = boto3.client("s3")
+    s3.download_file(bucket, key, local_path)
+    size_mb = os.path.getsize(local_path) / (1024 * 1024)
+    logger.info("s3_download_complete", size_mb=round(size_mb, 1))
+    return local_path
+
+
+# ===========================================================================
 # CLI ENTRY POINT
 # ===========================================================================
 
@@ -688,20 +738,27 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Firmable data ingestion pipeline")
     parser.add_argument(
-        "--csv", default="companies_sorted.csv",
-        help="Path to the source CSV file (default: companies_sorted.csv)",
+        "--csv", default=os.getenv("INGEST_CSV_S3_URI", "companies_sorted.csv"),
+        help="Path or s3://bucket/key URI for the source CSV file",
     )
     parser.add_argument(
         "--reset", action="store_true",
         help="Delete and recreate the index before ingesting",
     )
-    parser.add_argument("--host", default="localhost", help="OpenSearch host")
-    parser.add_argument("--port", type=int, default=9200, help="OpenSearch port")
+    parser.add_argument("--host", default=os.getenv("OPENSEARCH_HOST", "localhost"), help="OpenSearch host")
+    parser.add_argument("--port", type=int, default=int(os.getenv("OPENSEARCH_PORT", "9200")), help="OpenSearch port")
     parser.add_argument(
         "--chunk-size", type=int, default=CONFIG.chunk_size,
         help=f"Rows per CSV chunk (default: {CONFIG.chunk_size})",
     )
     args = parser.parse_args()
+
+    # If the CSV path is an S3 URI, download it to a temp directory first
+    csv_path = args.csv
+    tmp_dir = None
+    if csv_path.startswith("s3://"):
+        tmp_dir = tempfile.mkdtemp(prefix="firmable-ingest-")
+        csv_path = download_from_s3(csv_path, tmp_dir)
 
     # Override config if chunk size was passed via CLI
     config = PipelineConfig(chunk_size=args.chunk_size)
@@ -715,7 +772,7 @@ def main() -> None:
         create_index(client, config.index_name)
 
     # Run the pipeline
-    stats = run_pipeline(args.csv, client, model, config)
+    stats = run_pipeline(csv_path, client, model, config)
 
     print("\n" + "=" * 50)
     print("Ingestion Complete!")

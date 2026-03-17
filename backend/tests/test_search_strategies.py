@@ -102,7 +102,7 @@ class TestSemanticSearchStrategyRRF:
         mock_os = MagicMock()
         mock_os.search.return_value = _make_os_response([])
         mock_emb = MagicMock()
-        mock_emb.embed.return_value = [0.0] * 768
+        mock_emb.embed.return_value = [0.0] * 384
         return SemanticSearchStrategy(
             opensearch_service=mock_os,
             embedding_service=mock_emb,
@@ -137,3 +137,125 @@ class TestSemanticSearchStrategyRRF:
     def test_rrf_k_property_from_config(self, strategy):
         assert isinstance(strategy._RRF_K, int)
         assert strategy._RRF_K > 0
+
+
+# ---------------------------------------------------------------------------
+# RegularSearchStrategy — BM25 query structure
+# ---------------------------------------------------------------------------
+
+class TestRegularSearchStrategyQuery:
+    @pytest.fixture(autouse=True)
+    def strategy(self):
+        self._mock_os = MagicMock()
+        self._mock_os.search.return_value = _make_os_response([_make_hit("1", 1.0)])
+        from app.services.search_strategies import RegularSearchStrategy
+        return RegularSearchStrategy(opensearch_service=self._mock_os)
+
+    def test_build_bm25_query_has_function_score(self, strategy):
+        """Default config has popularity_boost_factor > 0 → function_score wrapper."""
+        q = strategy._build_bm25_query(_ctx("apple"))
+        assert "function_score" in q["query"]
+        funcs = q["query"]["function_score"]["functions"]
+        assert any("field_value_factor" in f for f in funcs)
+
+    def test_build_bm25_query_has_phrase_boost(self, strategy):
+        q = strategy._build_bm25_query(_ctx("apple"))
+        inner = q["query"]["function_score"]["query"]["bool"]
+        phrases = [c for c in inner.get("should", []) if "match_phrase" in c]
+        assert len(phrases) >= 1
+
+    def test_build_bm25_query_has_exact_name_term(self, strategy):
+        q = strategy._build_bm25_query(_ctx("apple"))
+        inner = q["query"]["function_score"]["query"]["bool"]
+        terms = [c for c in inner.get("should", []) if "term" in c]
+        assert any("name.keyword" in t["term"] for t in terms)
+
+
+# ---------------------------------------------------------------------------
+# SemanticSearchStrategy — mode routing
+# ---------------------------------------------------------------------------
+
+class TestSemanticSearchStrategyMode:
+    @pytest.fixture
+    def strategy(self):
+        from app.services.search_strategies import SemanticSearchStrategy
+        mock_os = MagicMock()
+        mock_os.search.return_value = _make_os_response([_make_hit("1", 0.9)])
+        mock_emb = MagicMock()
+        mock_emb.embed.return_value = [0.0] * 384
+        return SemanticSearchStrategy(
+            opensearch_service=mock_os,
+            embedding_service=mock_emb,
+        )
+
+    def test_search_uses_knn_mode_by_default(self, strategy):
+        """Config semantic.mode defaults to 'knn'."""
+        with patch("app.services.search_strategies.get_search_config") as mock_cfg:
+            cfg = mock_cfg.return_value
+            cfg.get.side_effect = lambda k, d=None: {"semantic": {"mode": "knn"}}.get(k, d)
+            with patch.object(strategy, "_search_knn", return_value=([], {})) as knn_mock, \
+                 patch.object(strategy, "_search_rrf", return_value=([], {})) as rrf_mock:
+                strategy.search(_ctx("clean tech"))
+                knn_mock.assert_called_once()
+                rrf_mock.assert_not_called()
+
+    def test_search_uses_rrf_mode_when_configured(self, strategy):
+        with patch("app.services.search_strategies.get_search_config") as mock_cfg:
+            cfg = mock_cfg.return_value
+            cfg.get.side_effect = lambda k, d=None: {"semantic": {"mode": "rrf"}}.get(k, d)
+            with patch.object(strategy, "_search_knn", return_value=([], {})) as knn_mock, \
+                 patch.object(strategy, "_search_rrf", return_value=([], {})) as rrf_mock:
+                strategy.search(_ctx("clean tech"))
+                rrf_mock.assert_called_once()
+                knn_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# AgenticSearchStrategy — _docs_to_results
+# ---------------------------------------------------------------------------
+
+class TestAgenticSearchStrategyDocsToResults:
+    @pytest.fixture
+    def strategy(self):
+        from app.services.search_strategies import AgenticSearchStrategy
+        mock_os = MagicMock()
+        mock_tool = MagicMock()
+        return AgenticSearchStrategy(opensearch_service=mock_os, tool_service=mock_tool)
+
+    def test_docs_to_results_preserves_event_data(self, strategy):
+        doc = {
+            "company_id": "c1",
+            "name": "FundedCo",
+            "domain": "funded.co",
+            "industry": "fintech",
+            "country": "US",
+            "locality": "NYC",
+            "_score": 1.0,
+            "_event_data": {
+                "event_type": "funding",
+                "amount": "$50M",
+                "round": "Series B",
+                "summary": "Raised $50M Series B",
+            },
+        }
+        results = strategy._docs_to_results([doc], _ctx("funded"))
+        assert results[0].event_data is not None
+        assert results[0].event_data.event_type == "funding"
+
+    def test_docs_to_results_preserves_linkedin_profile(self, strategy):
+        doc = {
+            "company_id": "c2",
+            "name": "LinkedCo",
+            "domain": "linked.co",
+            "industry": "tech",
+            "country": "US",
+            "locality": "SF",
+            "_score": 1.0,
+            "_linkedin_profile": {
+                "url": "https://linkedin.com/company/linkedco",
+                "followers": 1000,
+            },
+        }
+        results = strategy._docs_to_results([doc], _ctx("linked"))
+        assert results[0].linkedin_profile is not None
+        assert results[0].linkedin_profile["followers"] == 1000

@@ -15,13 +15,14 @@ Usage in services:
     metrics["search_requests_total"].add(1, {"query_type": "semantic"})
     trace_id = generate_trace_id()
 """
-from app.observability.logging import configure_logging, generate_trace_id, RequestLoggingMiddleware
+from app.observability.logging import configure_logging, configure_log_export, generate_trace_id, RequestLoggingMiddleware
 from app.observability.tracing import configure_tracing, get_tracer, instrument_fastapi
 from app.observability.metrics import configure_metrics, get_search_metrics
 from app.observability.events import log_search_classification, log_search_execution
 
 __all__ = [
     "configure_logging",
+    "configure_log_export",
     "generate_trace_id",
     "RequestLoggingMiddleware",
     "configure_tracing",

@@ -59,7 +59,7 @@ class CircuitBreaker:
         self,
         name: str,
         failure_threshold: int = 5,
-        timeout: float = 30.0,
+        timeout: float = 60.0,
     ) -> None:
         self.name = name
         self._failure_threshold = failure_threshold

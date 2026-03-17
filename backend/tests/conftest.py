@@ -71,6 +71,10 @@ def mock_opensearch():
                             "country": "US",
                             "locality": "San Francisco",
                             "searchable_text": "Acme Corp technology company",
+                            "year_founded": 2010,
+                            "size_range": "51-200",
+                            "current_employee_estimate": 100,
+                            "linkedin_url": "https://linkedin.com/company/acme-corp",
                         },
                     }
                 ],
@@ -103,7 +107,9 @@ def test_client(mock_opensearch):
     # Patch OTel setup to be no-ops during tests
     with patch("app.observability.tracing.configure_tracing"), \
          patch("app.observability.metrics.configure_metrics"), \
-         patch("app.observability.tracing.instrument_fastapi"):
+         patch("app.observability.logging.configure_log_export"), \
+         patch("app.observability.tracing.instrument_fastapi"), \
+         patch("app.main.instrument_fastapi"):
         from app.main import get_application
         app = get_application()
         with TestClient(app, raise_server_exceptions=True) as client:

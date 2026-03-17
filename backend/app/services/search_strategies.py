@@ -40,6 +40,7 @@ class SearchResult(BaseModel):
     size_range: Optional[str] = None
     current_employee_estimate: Optional[int] = None
     event_data: Optional[EventData] = None
+    linkedin_profile: Optional[Dict[str, Any]] = None
 
 
 class SearchContext(BaseModel):
@@ -118,9 +119,17 @@ class SearchStrategy(ABC):
                 }
             })
         if state := filters.get("location_state"):
-            clauses.append({"term": {"state": state.lower()}})
+            clauses.append({
+                "bool": {
+                    "should": [
+                        {"match_phrase": {"locality": state}},
+                        {"match": {"country": state.lower()}},   # handles city-state = country (e.g. Singapore)
+                    ],
+                    "minimum_should_match": 1,
+                }
+            })
         if city := filters.get("location_city"):
-            clauses.append({"term": {"city": city.lower()}})
+            clauses.append({"match_phrase": {"locality": city}})
         # Legacy 'location' key – match against country/state/city as a best-effort
         if loc := filters.get("location"):
             clauses.append({
@@ -238,7 +247,14 @@ class RegularSearchStrategy(SearchStrategy):
             raise
     
     def _build_bm25_query(self, context: SearchContext) -> Dict[str, Any]:
-        """Build OpenSearch BM25 query with field boosts from config."""
+        """Build OpenSearch BM25 query with field boosts from config.
+
+        Uses a tiered bool query:
+        - must: fuzzy multi_match across all fields (recall)
+        - should: match_phrase on name with high boost (precision — floats exact name matches to top)
+        - should: exact term match on name.keyword for precise name hits
+        Wrapped in function_score with log1p employee count boost for popularity.
+        """
         cfg = get_search_config().get("field_boosts", {}).get("bm25_regular", {})
         boosts = {
             "name": float(cfg.get("name", 2.0)),
@@ -247,6 +263,9 @@ class RegularSearchStrategy(SearchStrategy):
             "industry": float(cfg.get("industry", 1.0)),
             "locality": float(cfg.get("locality", 1.0)),
         }
+        phrase_boost = float(cfg.get("name_phrase_boost", 10.0))
+        popularity_factor = float(cfg.get("popularity_boost_factor", 0.2))
+
         must_clauses = []
         if context.optimized_query:
             must_clauses.append({
@@ -255,19 +274,64 @@ class RegularSearchStrategy(SearchStrategy):
                     "fields": self._boosts_to_fields(boosts),
                     "type": "best_fields",
                     "operator": "or",
-                    "fuzziness": "AUTO",
+                }
+            })
+
+        should_clauses = []
+        if context.optimized_query:
+            # Phrase match — rewards docs whose name contains the full phrase
+            should_clauses.append({
+                "match_phrase": {
+                    "name": {
+                        "query": context.optimized_query,
+                        "boost": phrase_boost,
+                    }
+                }
+            })
+            # Exact name match — strong boost for docs whose name exactly equals
+            # the query (handles "apple" matching "apple" but not "apple inc")
+            should_clauses.append({
+                "term": {
+                    "name.keyword": {
+                        "value": context.optimized_query.lower(),
+                        "boost": phrase_boost * 1.5,
+                    }
                 }
             })
 
         filter_clauses = self._build_filters(context.filters)
-        return {
-            "query": {
-                "bool": {
-                    "must": must_clauses if must_clauses else [{"match_all": {}}],
-                    "filter": filter_clauses,
+        bool_query: Dict[str, Any] = {
+            "must": must_clauses if must_clauses else [{"match_all": {}}],
+            "filter": filter_clauses,
+        }
+        if should_clauses:
+            bool_query["should"] = should_clauses
+
+        inner_query: Dict[str, Any] = {"bool": bool_query}
+
+        # Wrap in function_score for popularity boost (employee count).
+        # Disabled when factor is 0.
+        if popularity_factor > 0:
+            return {
+                "query": {
+                    "function_score": {
+                        "query": inner_query,
+                        "functions": [
+                            {
+                                "field_value_factor": {
+                                    "field": "current_employee_estimate",
+                                    "factor": popularity_factor,
+                                    "modifier": "log1p",
+                                    "missing": 1,
+                                }
+                            }
+                        ],
+                        "boost_mode": "multiply",
+                        "score_mode": "multiply",
+                    }
                 }
             }
-        }
+        return {"query": inner_query}
     
     def _process_results(self, response: Dict, context: SearchContext) -> List[SearchResult]:
         """Convert OpenSearch response to SearchResult objects"""
@@ -322,35 +386,119 @@ class SemanticSearchStrategy(SearchStrategy):
 
     def search(self, context: SearchContext) -> tuple[List[SearchResult], Dict[str, Any]]:
         """
-        Execute hybrid semantic search using true Reciprocal Rank Fusion (RRF).
+        Execute semantic search.
 
-        Two independent OpenSearch queries are issued:
-          1. BM25 (lexical) — multi_match with LLM-extracted field boosts
-          2. k-NN (vector)  — cosine similarity using a BGE query embedding
-
-        Results are merged with RRF:
-          rrf_score(doc) = 1/(k + bm25_rank) + 1/(k + knn_rank)
-
-        This avoids the scale-mismatch issue of combining raw BM25/L2 scores
-        in a bool.should clause, and produces significantly better rankings.
+        Mode is controlled by search_config.yaml  semantic.mode:
+          - "knn" (default): pure k-NN vector search — single OpenSearch query.
+          - "rrf": hybrid Reciprocal Rank Fusion merging BM25 + k-NN legs.
         """
+        mode = get_search_config().get("semantic", {}).get("mode", "knn")
+        if mode == "rrf":
+            return self._search_rrf(context)
+        return self._search_knn(context)
+
+    # ------------------------------------------------------------------
+    # Pure k-NN path
+    # ------------------------------------------------------------------
+
+    def _search_knn(self, context: SearchContext) -> tuple[List[SearchResult], Dict[str, Any]]:
+        """Pure k-NN vector search — single OpenSearch query."""
         start_time = time.time()
 
         logger.info(
             "semantic_search_started",
             trace_id=context.trace_id,
-            query=context.query[:100]
+            query=context.query[:100],
+            mode="knn",
         )
 
         try:
-            # Generate BGE query embedding (with asymmetric retrieval prefix)
             embedding = self.embeddings.embed(context.optimized_query)
 
-            # Over-fetch for both legs so RRF has enough candidates
+            knn_response = self.opensearch.search(
+                index=get_settings().OPENSEARCH_INDEX_NAME,
+                body=self._build_knn_query(context, embedding),
+                size=context.limit,
+                from_=0,
+            )
+
+            knn_hits = knn_response.get("hits", {}).get("hits", [])
+
+            page_start = (context.page - 1) * context.limit
+            page_hits = knn_hits[page_start: page_start + context.limit]
+
+            results = self._process_knn_results(page_hits, context)
+
+            execution_time = time.time() - start_time
+            metadata = {
+                "strategy": self.strategy_type,
+                "mode": "knn",
+                "total_hits": len(knn_hits),
+                "returned": len(results),
+                "execution_time_ms": int(execution_time * 1000),
+                "embedding_dim": len(embedding) if embedding else 0,
+                "score_range": self._get_score_range(results),
+            }
+
+            logger.info(
+                "semantic_search_completed",
+                trace_id=context.trace_id,
+                **metadata,
+            )
+
+            return results, metadata
+
+        except Exception as e:
+            logger.error(
+                "semantic_search_failed",
+                trace_id=context.trace_id,
+                error=str(e),
+            )
+            raise
+
+    def _process_knn_results(self, hits: List[Dict], context: SearchContext) -> List[SearchResult]:
+        """Convert k-NN hits to SearchResult objects."""
+        results = []
+        for hit in hits:
+            source = hit.get("_source", {})
+            results.append(SearchResult(
+                company_id=source.get("company_id", hit.get("_id")),
+                company_name=source.get("name"),
+                domain=source.get("domain"),
+                industry=source.get("industry"),
+                country=source.get("country"),
+                locality=source.get("locality"),
+                relevance_score=float(hit.get("_score", 0)),
+                search_method=self.strategy_type,
+                ranking_source="knn",
+                matching_reason="Semantic vector similarity match",
+                year_founded=source.get("year_founded"),
+                size_range=source.get("size_range"),
+                current_employee_estimate=source.get("current_employee_estimate"),
+            ))
+        return results
+
+    # ------------------------------------------------------------------
+    # RRF hybrid path
+    # ------------------------------------------------------------------
+
+    def _search_rrf(self, context: SearchContext) -> tuple[List[SearchResult], Dict[str, Any]]:
+        """Hybrid search using Reciprocal Rank Fusion (BM25 + k-NN)."""
+        start_time = time.time()
+
+        logger.info(
+            "semantic_search_started",
+            trace_id=context.trace_id,
+            query=context.query[:100],
+            mode="rrf",
+        )
+
+        try:
+            embedding = self.embeddings.embed(context.optimized_query)
+
             rrf_cfg = get_search_config().get("rrf", {})
             fetch_size = max(context.limit * rrf_cfg.get("fetch_multiplier", 4), 100)
 
-            # --- BM25 leg ---
             bm25_response = self.opensearch.search(
                 index=get_settings().OPENSEARCH_INDEX_NAME,
                 body=self._build_bm25_query(context),
@@ -358,7 +506,6 @@ class SemanticSearchStrategy(SearchStrategy):
                 from_=0,
             )
 
-            # --- k-NN leg ---
             knn_response = self.opensearch.search(
                 index=get_settings().OPENSEARCH_INDEX_NAME,
                 body=self._build_knn_query(context, embedding),
@@ -366,12 +513,10 @@ class SemanticSearchStrategy(SearchStrategy):
                 from_=0,
             )
 
-            # --- RRF merge ---
             bm25_hits = bm25_response.get("hits", {}).get("hits", [])
             knn_hits = knn_response.get("hits", {}).get("hits", [])
             merged_hits = self._rrf_merge(bm25_hits, knn_hits)
 
-            # Paginate after merge
             page_start = (context.page - 1) * context.limit
             page_hits = merged_hits[page_start: page_start + context.limit]
 
@@ -381,6 +526,7 @@ class SemanticSearchStrategy(SearchStrategy):
             effective_boosts = self._resolve_field_boosts(context)
             metadata = {
                 "strategy": self.strategy_type,
+                "mode": "rrf",
                 "total_hits": len(merged_hits),
                 "returned": len(results),
                 "execution_time_ms": int(execution_time * 1000),
@@ -627,9 +773,12 @@ class AgenticSearchStrategy(SearchStrategy):
         data_type = context.filters.get("external_data_type", "external")
         for doc in docs:
             event = doc.get("_event_data")
+            profile = doc.get("_linkedin_profile")
             if event and event.get("summary"):
                 date_suffix = f" ({event['date']})" if event.get("date") else ""
                 matching_reason = f"{event['summary']}{date_suffix}"
+            elif profile and profile.get("description"):
+                matching_reason = profile["description"][:200]
             else:
                 matching_reason = f"Identified via {data_type} data for query: {context.query[:60]}"
             results.append(SearchResult(
@@ -644,6 +793,7 @@ class AgenticSearchStrategy(SearchStrategy):
                 ranking_source="tool",
                 matching_reason=matching_reason,
                 event_data=event,
+                linkedin_profile=doc.get("_linkedin_profile"),
             ))
         return results
 
@@ -651,6 +801,10 @@ class AgenticSearchStrategy(SearchStrategy):
         """
         Apply user-selected filters as post-processing on agentic results.
         This is a soft filter — we narrow down what the external tool returned.
+
+        Important: docs with empty location/industry fields are KEPT — we don't
+        know their values so we can't safely exclude them (prevents synthetic
+        docs from being dropped when a location filter is active).
         """
         filters = context.filters
         if not filters:
@@ -658,23 +812,44 @@ class AgenticSearchStrategy(SearchStrategy):
 
         filtered = []
         for r in results:
-            # Country filter
+            # Country filter — skip if the doc has no country data
             if country := filters.get("location_country"):
-                if country.lower() not in (r.country or "").lower():
+                if (r.country or "") and country.lower() not in (r.country or "").lower():
                     continue
-            # Industry filter (loose match against the industry string)
-            if industry := filters.get("industry"):
-                if industry.lower() not in (r.industry or "").lower():
+            # State filter — check against locality string; skip if no locality data
+            if state := filters.get("location_state"):
+                if (r.locality or "") and state.lower() not in (r.locality or "").lower():
+                    continue
+            # City filter — check against locality string; skip if no locality data
+            if city := filters.get("location_city"):
+                if (r.locality or "") and city.lower() not in (r.locality or "").lower():
+                    continue
+            # Industry filter — skip if the doc has no industry data
+            industries: List[str] = filters.get("industries") or []
+            if not industries and filters.get("industry"):
+                industries = [filters["industry"]]
+            if industries and (r.industry or ""):
+                if not any(ind.lower() in (r.industry or "").lower() for ind in industries):
                     continue
             filtered.append(r)
 
+        logger.info(
+            "post_filter_applied",
+            before=len(results),
+            after=len(filtered),
+            filters={k: v for k, v in filters.items() if k in (
+                "location_country", "location_state", "location_city", "industry", "industries"
+            )},
+        )
         if not filtered:
             logger.warning(
                 "post_filter_dropped_all",
                 result_count=len(results),
                 filters=filters,
             )
-            return []
+            # Return all results rather than an empty list — location/industry
+            # filtering is best-effort on agentic results which may lack metadata.
+            return results
         return filtered
 
     def get_strategy_type(self) -> str:

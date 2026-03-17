@@ -3,11 +3,17 @@ rrf:
   knn_k: 100
   fetch_multiplier: 4
 
+semantic:
+  # Search mode for the semantic strategy.
+  #   "knn" — pure k-NN vector search only (faster, no BM25 leg)
+  #   "rrf" — hybrid Reciprocal Rank Fusion merging BM25 + k-NN (better precision)
+  mode: "knn"
+
 field_boosts:
   defaults:                 # SemanticSearchStrategy._DEFAULT_FIELD_BOOSTS
     name: 2.0
     domain: 1.0
-    searchable_text: 2.0
+    searchable_text: 1.0
     industry: 1.0
     locality: 1.0
   bm25_regular:             # RegularSearchStrategy _build_bm25_query field weights
@@ -16,6 +22,10 @@ field_boosts:
     searchable_text: 1.0
     industry: 1.0
     locality: 1.0
+    name_phrase_boost: 10.0
+    # Popularity boost: multiplies BM25 score by (1 + factor * log(1 + employee_count)).
+    # Set to 0 to disable. Typical range: 0.1 – 0.5
+    popularity_boost_factor: 2.0
 
 cache:
   embedding_maxsize: 512
@@ -37,18 +47,18 @@ agentic:
   #   gpt-4o-mini  (fast, cheap, good for most queries)
   #   gpt-4o       (best reasoning, use for complex multi-step queries)
   #   gpt-4-turbo  (balanced)
-  model: "gpt-4o-mini"
+  model: "gpt-4o"
   # Maximum agent iterations before giving up
   agent_max_iterations: 5
   # Maximum company names the LLM may return per extraction call
   max_company_names: 20
   # Token budget for the LLM event-extraction call
-  llm_max_tokens: 800
+  llm_max_tokens: 1200
   # OpenSearch candidates to fetch per resolved company name
-  resolve_per_name: 2
+  resolve_per_name: 5
   # Minimum OpenSearch score to accept a resolved company (avoids false matches)
-  min_resolve_score: 1.0
+  min_resolve_score: 0.5
   # Tavily web-search max results (only used when TAVILY_API_KEY is set)
-  tavily_max_results: 5
+  tavily_max_results: 10
   # Tavily HTTP request timeout in seconds
   tavily_timeout_s: 8

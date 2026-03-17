@@ -76,6 +76,7 @@ class CompanyResult(BaseModel):
     size_range: Optional[str] = None
     current_employee_estimate: Optional[int] = None
     event_data: Optional[Dict[str, Any]] = None
+    linkedin_profile: Optional[Dict[str, Any]] = None
 
 
 class SearchMetadata(BaseModel):
@@ -283,6 +284,18 @@ async def health_check():
             "status": "unhealthy",
             "error": str(e)
         }
+
+
+@router.get("/top-queries", tags=["diagnostics"])
+async def top_queries(limit: int = Query(10, ge=1, le=100, description="Number of top queries to return")):
+    """Return the most frequently searched queries with hit counts."""
+    from app.services.cache_service import get_cache_service
+    cache = get_cache_service()
+    return {
+        "top_queries": cache.get_top_queries(limit),
+        "storage": "redis" if cache.is_available else "in_memory",
+        "note": "in_memory counts reset on server restart" if not cache.is_available else None,
+    }
 
 
 @router.get("/features", tags=["diagnostics"])

@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     CLASSIFIER_CONFIDENCE_THRESHOLD: float = 0.7
     CLASSIFIER_TIMEOUT: int = 10  # seconds
 
+    # Redis Cache
+    REDIS_URL: str = "redis://localhost:6379"
+    CACHE_TTL_SECONDS: int = 10
+
     # Tracing & Observability — app sends to OTel Collector via OTLP/gRPC
     OTLP_ENDPOINT: str = "http://localhost:4317"
     OTEL_SERVICE_NAME: str = "firmable-search"

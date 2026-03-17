@@ -43,6 +43,7 @@ logger = structlog.get_logger(__name__)
 # injected (each call adds it in the user message). The system prompt uses
 # {today} which is .format()-ed at agent construction time.
 _EXTRACTION_SYSTEM_PROMPT: str = load_prompt("agent_extraction.txt")
+_LINKEDIN_EXTRACTION_PROMPT: str = load_prompt("agent_linkedin_extraction.txt")
 _SYSTEM_PROMPT_TEMPLATE: str = load_prompt("agent_system.txt")
 
 # ── Pydantic models for external data boundaries ─────────────────────────────
@@ -79,6 +80,20 @@ class EventExtractionResponse(BaseModel):
     events: list[CompanyEvent] = []
 
 
+class LinkedInProfile(BaseModel):
+    """Structured company profile extracted from LinkedIn page."""
+    description: Optional[str] = None
+    headquarters: Optional[str] = None
+    industry: Optional[str] = None
+    company_size: Optional[str] = None
+    specialties: list[str] = []
+    founded_year: Optional[int] = None
+    website: Optional[str] = None
+    recent_updates: Optional[str] = None
+
+    model_config = {"extra": "ignore"}
+
+
 class EnrichedCompanyDoc(BaseModel):
     """Final typed output per company — the shape submit_final_results produces."""
     id: str
@@ -89,6 +104,7 @@ class EnrichedCompanyDoc(BaseModel):
     locality: str = ""
     score: float = 1.0
     event_data: Optional[EventData] = None
+    linkedin_profile: Optional[dict] = None
 
     model_config = {"extra": "ignore"}
 
@@ -104,6 +120,13 @@ class LookupNamesInput(BaseModel):
     company_names: str = Field(
         ...,
         description="Comma-separated list of company names to look up in the database",
+    )
+
+
+class LinkedInLookupInput(BaseModel):
+    company_name: str = Field(
+        ...,
+        description="Name of the company to look up on LinkedIn",
     )
 
 
@@ -148,7 +171,14 @@ class AgentService:
         self._llm_max_tokens: int = int(_cfg.get("llm_max_tokens", 800))
 
         # Plain OpenAI client used for structured event extraction.
-        self._openai = OpenAI(api_key=openai_api_key)
+        # Short keepalive_expiry prevents stale connections after long idle.
+        import httpx as _httpx
+        self._openai = OpenAI(
+            api_key=openai_api_key,
+            http_client=_httpx.Client(
+                limits=_httpx.Limits(keepalive_expiry=30),
+            ),
+        )
         self._extraction_model = model
 
         # LangChain agent — imported here to keep startup fast if agentic search
@@ -474,7 +504,190 @@ class AgentService:
 
             return json.dumps({"found": len(results), "companies": results})
 
-        # ── Tool 3: submit_final_results ──────────────────────────────
+        # ── Tool 3: linkedin_profile_lookup ────────────────────────────
+
+        def linkedin_profile_lookup(company_name: str) -> str:
+            """
+            Look up a company's LinkedIn profile to get detailed company
+            information: description, headquarters, industry, size,
+            specialties, and recent updates.
+            """
+            # Step 1: Find company in OpenSearch to get linkedin_url
+            linkedin_url: Optional[str] = None
+            company_doc: Optional[dict] = None
+            try:
+                resp = svc._opensearch.search(
+                    index=svc._index,
+                    query={
+                        "multi_match": {
+                            "query": company_name,
+                            "fields": ["name^3", "domain"],
+                            "type": "best_fields",
+                            "fuzziness": "AUTO",
+                        }
+                    },
+                    size=1,
+                )
+                hits = resp.get("hits", {}).get("hits", [])
+                if hits:
+                    src = hits[0]["_source"]
+                    linkedin_url = src.get("linkedin_url")
+                    company_doc = {
+                        "id": hits[0].get("_id", ""),
+                        "name": src.get("name", company_name),
+                        "domain": src.get("domain", ""),
+                        "industry": src.get("industry", ""),
+                        "country": src.get("country", ""),
+                        "locality": src.get("locality", ""),
+                        "score": float(hits[0].get("_score", 1.0)),
+                    }
+            except Exception as e:
+                logger.warning("linkedin_opensearch_lookup_failed", name=company_name, error=str(e))
+
+            # Step 2: Resolve LinkedIn URL (from index or fallback slug)
+            if not linkedin_url:
+                import re as _re
+                slug = _re.sub(r"[^a-z0-9-]", "", company_name.lower().replace(" ", "-"))
+                linkedin_url = f"https://www.linkedin.com/company/{slug}"
+                logger.info(
+                    "linkedin_url_fallback",
+                    company=company_name,
+                    fallback_url=linkedin_url,
+                )
+
+            # Step 3: Fetch LinkedIn page content via Tavily extract
+            profile_data: Optional[dict] = None
+            if svc._tavily_key:
+                import requests
+
+                url = linkedin_url if linkedin_url.startswith("http") else f"https://{linkedin_url}"
+                page_content = ""
+
+                # --- Attempt A: Tavily Extract (direct page scrape) ---
+                logger.info("linkedin_attempting_scrape", company=company_name, url=url)
+                try:
+                    extract_resp = requests.post(
+                        "https://api.tavily.com/extract",
+                        json={
+                            "api_key": svc._tavily_key,
+                            "urls": [url],
+                        },
+                        timeout=svc._tavily_timeout_s,
+                    )
+                    extract_resp.raise_for_status()
+                    extract_results = extract_resp.json().get("results", [])
+                    page_content = (
+                        extract_results[0].get("raw_content", "") if extract_results else ""
+                    )
+                    if not page_content:
+                        logger.warning(
+                            "linkedin_tavily_extract_empty",
+                            company=company_name,
+                            url=url,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "linkedin_tavily_extract_failed",
+                        company=company_name,
+                        url=url,
+                        error=str(e),
+                    )
+
+                # --- Attempt B: Tavily Search fallback (snippet from web) ---
+                if not page_content:
+                    try:
+                        search_resp = requests.post(
+                            "https://api.tavily.com/search",
+                            json={
+                                "api_key": svc._tavily_key,
+                                "query": f"{company_name} LinkedIn company profile site:linkedin.com",
+                                "max_results": 3,
+                                "include_raw_content": True,
+                            },
+                            timeout=svc._tavily_timeout_s,
+                        )
+                        search_resp.raise_for_status()
+                        search_results = search_resp.json().get("results", [])
+                        for sr in search_results:
+                            raw_content = sr.get("raw_content") or sr.get("content", "")
+                            if raw_content and len(raw_content) > 100:
+                                page_content = raw_content
+                                logger.info(
+                                    "linkedin_tavily_search_fallback_hit",
+                                    company=company_name,
+                                    source_url=sr.get("url", ""),
+                                )
+                                break
+                        if not page_content:
+                            logger.warning(
+                                "linkedin_tavily_search_fallback_empty",
+                                company=company_name,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "linkedin_tavily_search_fallback_failed",
+                            company=company_name,
+                            error=str(e),
+                        )
+
+                # --- Step 4: Extract structured profile with LLM ---
+                if page_content:
+                    try:
+                        user_msg = (
+                            f"Company: {company_name}\n"
+                            f"LinkedIn URL: {url}\n\n"
+                            f"Page content:\n{page_content[:3000]}"
+                        )
+                        llm_resp = svc._openai.chat.completions.create(
+                            model=svc._extraction_model,
+                            messages=[
+                                {"role": "system", "content": _LINKEDIN_EXTRACTION_PROMPT},
+                                {"role": "user", "content": user_msg},
+                            ],
+                            max_tokens=600,
+                            temperature=0,
+                            response_format={"type": "json_object"},
+                        )
+                        raw = llm_resp.choices[0].message.content.strip()
+                        profile_data = LinkedInProfile.model_validate_json(raw).model_dump()
+                        logger.info(
+                            "linkedin_profile_extracted",
+                            company=company_name,
+                            url=url,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "linkedin_llm_extraction_failed",
+                            company=company_name,
+                            error=str(e),
+                        )
+                else:
+                    logger.warning(
+                        "linkedin_no_page_content",
+                        company=company_name,
+                        url=url,
+                    )
+
+            # Build result
+            if company_doc:
+                result = dict(company_doc)
+            else:
+                synthetic_id = f"synthetic_{hashlib.sha256(company_name.encode()).hexdigest()[:16]}"
+                result = {
+                    "id": synthetic_id,
+                    "name": company_name,
+                    "domain": "",
+                    "industry": "",
+                    "country": "",
+                    "locality": "",
+                    "score": 1.0,
+                }
+            if profile_data:
+                result["linkedin_profile"] = profile_data
+
+            return json.dumps({"found": 1, "companies": [result]})
+
+        # ── Tool 4: submit_final_results ──────────────────────────────
 
         def submit_final_results(results_json: str = "[]") -> str:
             """
@@ -531,6 +744,17 @@ class AgentService:
                     "Input: comma-separated company names."
                 ),
                 args_schema=LookupNamesInput,
+            ),
+            StructuredTool.from_function(
+                func=linkedin_profile_lookup,
+                name="linkedin_profile_lookup",
+                description=(
+                    "Look up a company's LinkedIn profile to get detailed information: "
+                    "description, headquarters, industry, company size, specialties, "
+                    "and recent updates. Use for queries asking about a specific company's "
+                    "profile or details."
+                ),
+                args_schema=LinkedInLookupInput,
             ),
             StructuredTool.from_function(
                 func=submit_final_results,
@@ -602,6 +826,8 @@ class AgentService:
                 }
                 if doc.event_data:
                     entry["_event_data"] = doc.event_data.model_dump()
+                if doc.linkedin_profile:
+                    entry["_linkedin_profile"] = doc.linkedin_profile
                 normalised.append(entry)
             except Exception as e:
                 logger.warning("output_normalisation_failed", error=str(e))

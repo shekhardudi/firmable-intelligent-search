@@ -11,6 +11,7 @@ from enum import Enum
 from datetime import datetime
 import instructor
 from openai import OpenAI
+import httpx
 from pydantic import BaseModel, Field
 from app.config import get_settings, get_search_config
 from app.utils.cache import BoundedDict
@@ -81,8 +82,14 @@ class IntentClassifier:
         """Initialize classifier with Instructor-patched OpenAI client"""
         self.settings = get_settings()
         
-        # Create base OpenAI client
-        self.client = OpenAI(api_key=self.settings.OPENAI_API_KEY)
+        # Create base OpenAI client with a short pool idle timeout so
+        # connections don't go stale during long periods without searches.
+        self.client = OpenAI(
+            api_key=self.settings.OPENAI_API_KEY,
+            http_client=httpx.Client(
+                limits=httpx.Limits(keepalive_expiry=30),
+            ),
+        )
         
         # Patch with Instructor for structured outputs
         self.client = instructor.from_openai(self.client)
@@ -137,7 +144,12 @@ Return a JSON object with ALL of these keys:
     "industry": "...",           // canonical industry label or null
     "year_from": null,           // integer year or null
     "year_to": null,             // integer year or null
-    "size_range": null           // e.g. "1-10", "startups", or null
+    "size_range": null           // MUST be EXACTLY one of these strings (verbatim) or null:
+                                 // "1-10", "11-50", "51-200", "201-500",
+                                 // "501-1000", "1001-5000", "5001-10000", "10001+"
+                                 // Map concepts: startups/micro→"1-10", small→"11-50",
+                                 // growing→"51-200", mid-size→"201-500",
+                                 // large→"1001-5000", enterprise/Fortune500→"10001+"
   }}
 - needs_external_data: true/false
 - external_data_type: null or "news"|"funding"|"events"
@@ -147,7 +159,7 @@ Return a JSON object with ALL of these keys:
         try:
             import time as _time
             _t0 = _time.perf_counter()
-            response = self.client.messages.create(
+            response = self.client.chat.completions.create(
                 model=self.model,
                 max_tokens=1000,
                 messages=[

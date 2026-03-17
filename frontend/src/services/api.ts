@@ -22,6 +22,17 @@ export interface IntelligentCompanyResult {
   year_founded?: number;
   size_range?: string;
   current_employee_estimate?: number;
+  event_data?: Record<string, unknown>;
+  linkedin_profile?: {
+    description?: string;
+    headquarters?: string;
+    industry?: string;
+    company_size?: string;
+    specialties?: string[];
+    founded_year?: number;
+    website?: string;
+    recent_updates?: string;
+  };
 }
 
 export interface IntelligentSearchResponse {
@@ -34,6 +45,7 @@ export interface IntelligentSearchResponse {
       confidence: number;
       reasoning: string;
       needs_external_data: boolean;
+      classified_by?: 'regex' | 'llm';
     };
     search_execution: Record<string, unknown>;
     total_results: number;
@@ -74,3 +86,43 @@ export const healthCheck = async () => {
   const response = await api.get('/api/search/health');
   return response.data;
 };
+
+// ── Client-side autocomplete suggestions ──────────────────────────────────
+const SUGGESTION_LIST = [
+  'tech companies in California',
+  'fintech startups in New York',
+  'healthcare companies in London',
+  'software companies in San Francisco',
+  'AI companies in Seattle',
+  'enterprise software companies',
+  'SaaS companies in Europe',
+  'biotech companies in Boston',
+  'e-commerce companies in Asia',
+  'cybersecurity companies',
+  'companies that raised Series B funding',
+  'companies with recent IPO',
+  'renewable energy companies',
+  'manufacturing companies in Germany',
+  'logistics and supply chain companies',
+  'media companies in Los Angeles',
+  'consulting firms in Chicago',
+  'retail companies in UK',
+  'companies founded after 2015',
+  'large enterprise companies over 10000 employees',
+  'small tech startups',
+  'companies in Australia',
+  'telecommunications companies',
+  'food technology companies',
+  'automotive companies',
+  'financial services companies',
+  'real estate technology companies',
+  'education technology startups',
+  'marketing technology companies',
+  'cloud infrastructure companies',
+];
+
+export function getAutocompleteSuggestions(query: string): string[] {
+  const q = query.toLowerCase().trim();
+  if (!q || q.length < 2) return [];
+  return SUGGESTION_LIST.filter(s => s.toLowerCase().includes(q)).slice(0, 6);
+}

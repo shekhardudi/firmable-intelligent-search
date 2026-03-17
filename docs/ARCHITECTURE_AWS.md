@@ -77,10 +77,10 @@ inside a VPC with private subnets; only the ALB is internet-facing.
 │   │                              │                                       │  │
 │   │               ┌──────────────┼──────────────────┐                   │  │
 │   │               ▼              ▼                  ▼                   │  │
-│   │        CloudWatch        X-Ray                Managed               │  │
-│   │        Metrics &         Traces               Prometheus            │  │
-│   │        Logs              (distributed         (AMP) + Grafana       │  │
-│   │                           tracing)            (AMG dashboards)      │  │
+│   │        CloudWatch        X-Ray                CloudWatch            │  │
+│   │        Metrics (EMF)     Traces               Container             │  │
+│   │        + Logs            (distributed         Insights              │  │
+│   │                           tracing)            (dashboards)          │  │
 │   └─────────────────────────────────────────────────────────────────────┘  │
 │                                                                             │
 │   ┌─────────────────────────────────────────────────────────────────────┐  │
@@ -89,8 +89,9 @@ inside a VPC with private subnets; only the ALB is internet-facing.
 │   │  GitHub Actions ──push──▶ ECR (backend + worker images)             │  │
 │   │                  ──deploy──▶ ECS rolling update (blue/green)        │  │
 │   │                                                                      │  │
-│   │  S3: embedding model artefacts (msmarco-distilbert-base-tas-b)      │  │
-│   │      loaded at container start via ECS task role                    │  │
+│   │  Embedding model (msmarco-distilbert-base-tas-b) is baked into the  │  │
+│   │  Docker image at build time (COPY . . in Dockerfile). No S3         │  │
+│   │  download at container start — zero cold-start penalty.             │  │
 │   └─────────────────────────────────────────────────────────────────────┘  │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -125,12 +126,42 @@ ThreadPoolExecutor(128) per backend task gives headroom for 64 RPS at 2s average
   │  facing)          │──────────│  ECS Agentic Worker tasks         │
   │  NAT Gateway      │          │  OpenSearch Service domain        │
   └───────────────────┘          │  ElastiCache subnet group         │
-                                 │  SQS VPC endpoint                 │
-                                 │  Secrets Manager VPC endpoint     │
+                                 │  VPC Interface Endpoints:         │
+                                 │    SQS, SecretsManager, ECR,      │
+                                 │    CloudWatch Logs, X-Ray         │
+                                 │  VPC Gateway Endpoint: S3         │
                                  └───────────────────────────────────┘
 ```
 
 ## Key AWS Services
+
+NAT Gateway is still required for external HTTPS calls (OpenAI, Tavily). All
+AWS-internal service calls use VPC Endpoints, eliminating the $0.045/GB NAT
+data-processing charge on those traffic paths.
+
+## Observability: Zero Code Changes Between Environments
+
+The app always sends `OTLP/gRPC` to `localhost:4317` (env var `OTLP_ENDPOINT`,
+default `http://localhost:4317`).
+
+| Environment | What listens on localhost:4317            | Backends                                        |
+|-------------|------------------------------------------|-------------------------------------------------|
+| Local dev   | OTel Collector (docker-compose service)  | Prometheus + Jaeger → Grafana                   |
+| AWS ECS     | ADOT sidecar (same task network ns)      | X-Ray (traces) + CloudWatch EMF (metrics/logs)  |
+
+The ADOT sidecar uses the AWS-managed default config
+(`/etc/ecs/ecs-default-config.yaml`), which handles OTLP→X-Ray protocol
+translation automatically. For custom attribute enrichment or metric filtering,
+see `infrastructure/otel-collector/otelcol-config-aws.yaml`.
+
+**Why not X-Ray SDK directly?** Requires SDK-specific instrumentation calls
+instead of vendor-neutral OTel spans — swapping backends would then require
+code changes. ADOT sidecar gives full backend flexibility with zero app coupling.
+
+**Why CloudWatch over AMP+AMG?** At this scale, CloudWatch Container Insights
+costs less to operate and needs no extra workspace provisioning. AMP+AMG becomes
+worthwhile above ~500 RPS or when cross-account metric federation is needed.
+
 
 | Component              | AWS Service                      | Notes                                          |
 |------------------------|----------------------------------|------------------------------------------------|
@@ -141,9 +172,10 @@ ThreadPoolExecutor(128) per backend task gives headroom for 64 RPS at 2s average
 | Async queue            | SQS FIFO                         | Deduplication by SHA-256(query)                |
 | Secrets                | AWS Secrets Manager              | Rotated API keys; ECS task IAM role            |
 | Container registry     | Amazon ECR                       | Image scanning enabled                         |
-| Tracing                | AWS X-Ray via ADOT               | Instrumented with OTel SDK                     |
-| Metrics                | Amazon Managed Prometheus (AMP)  | Scraped from ADOT collector sidecar            |
-| Dashboards             | Amazon Managed Grafana (AMG)     | Pre-built: latency, throughput, error rate     |
-| Logs                   | CloudWatch Logs                  | Structured JSON via structlog                  |
+| Tracing                | AWS X-Ray via ADOT sidecar       | OTLP→X-Ray, zero app-code changes              |
+| Metrics                | CloudWatch Metrics (EMF)         | Pushed by ADOT sidecar, Container Insights     |
+| Dashboards             | CloudWatch Container Insights    | Latency, CPU, memory, error rate               |
+| Logs                   | CloudWatch Logs                  | Structured JSON via structlog + awslogs driver |
 | DNS                    | Route 53                         | Latency-based routing, health-check failover   |
 | TLS                    | ACM (auto-renew)                 | SNI on ALB                                     |
+| VPC Endpoints          | Interface (SQS/ECR/CW/SM/X-Ray) + Gateway (S3) | Eliminate NAT cost for AWS-internal traffic |

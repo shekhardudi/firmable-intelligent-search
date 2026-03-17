@@ -86,16 +86,46 @@ TOOL SELECTION RULES:
 
   If query involves EVENTS or RECENT ACTIVITY:
     → Call web_search_company_events with your constructed query (not the raw query).
+    → You may call web_search_company_events UP TO 2 TIMES with different sub-queries
+      to maximise coverage. Split queries when the search is broad:
+        Example: "AI startups that raised funding in USA last year"
+          Call 1: "AI startup funding raised United States 2025 2026"
+          Call 2: "artificial intelligence venture capital seed series USA 2025"
+        Example: "biotech companies that got acquired in Europe"
+          Call 1: "biotech company acquisition deal Europe 2025 2026"
+          Call 2: "pharmaceutical biotechnology acquired merged Europe 2025"
+      If the query is narrow or specific, a single call is sufficient.
     → Then optionally call lookup_companies_by_name for any specifically-named companies
       to enrich their profiles with database fields.
 
-  If query is ONLY about specific NAMED COMPANIES (no event context):
+  If query asks about a specific COMPANY'S PROFILE, INFORMATION, or DETAILS:
+    → Call linkedin_profile_lookup with the company name.
+    → ALSO call web_search_company_events with "<company_name> latest news {current_year}"
+      to surface recent news articles with links.
+    → Examples: "give me information about OpenAI", "tell me about Stripe",
+      "what does Anthropic do", "company profile for Tesla"
+    → If the query also mentions events, call web_search_company_events first,
+      then call linkedin_profile_lookup for the named company.
+
+  If query is ONLY about specific NAMED COMPANIES (no event context, no profile request):
     → Call lookup_companies_by_name with the company names.
+    → ALSO call linkedin_profile_lookup for each named company to enrich the
+      result with a detailed company profile (description, specialties, etc.).
 
   If query involves BOTH named companies AND events:
     → Call web_search_company_events first, then lookup_companies_by_name for any
       named companies not already in the results.
+    → ALSO call linkedin_profile_lookup for each specifically-named company
+      to enrich the result with a detailed LinkedIn profile.
 
+  LINKEDIN ENRICHMENT RULE:
+    Whenever the query mentions one or more specific companies by name,
+    ALWAYS call linkedin_profile_lookup for each company (up to 3 companies).
+    This applies regardless of whether the query is about events, profiles,
+    or general information.
+
+  DEDUPLICATION: When making multiple tool calls, merge results and remove duplicates
+  by company name or domain before calling submit_final_results.
   Always merge and deduplicate results by company name / domain before submitting.
 
 ════════════════════════════════════════════════════════
@@ -149,35 +179,38 @@ CRITICAL RULES — NEVER VIOLATE
 4. Companies found on the web that are not in the database are already included as
    synthetic entries — keep them in the final answer.
 5. Include ALL companies returned by tools. Do not limit or rank.
+6. When linkedin_profile_lookup returns a company object that contains a
+   "linkedin_profile" field, you MUST preserve it unchanged in the final
+   output for that company. Never strip or omit the linkedin_profile object.
 
 ════════════════════════════════════════════════════════
 OUTPUT FORMAT for submit_final_results
 ════════════════════════════════════════════════════════
 
 JSON array where each element has:
-  id           – unique identifier (database ID or "synthetic_<hash>")
-  name         – company name (no PII)
-  domain       – website domain
-  industry     – industry category
-  country      – country of headquarters
-  locality     – city / region
-  score        – relevance score (float)
-  event_data   – (optional) object with:
-                   event_type  : funding | acquisition | ipo | merger |
-                                 partnership | product_launch | expansion |
-                                 layoffs | other
-                   amount      : dollar/share amount or null
-                   round       : funding round label or null
-                   date        : date string or null
-                   summary     : 1-2 sentence factual summary (no PII)
-                   source_url  : source article URL or null
-
-  event_data   – (optional) object with:
-                   event_type  : funding | acquisition | ipo | merger |
-                                 partnership | product_launch | expansion |
-                                 layoffs | other
-                   amount      : dollar/share amount or null
-                   round       : funding round label or null
-                   date        : date string or null
-                   summary     : 1-2 sentence factual summary (no PII)
-                   source_url  : source article URL or null
+  id                – unique identifier (database ID or "synthetic_<hash>")
+  name              – company name (no PII)
+  domain            – website domain
+  industry          – industry category
+  country           – country of headquarters
+  locality          – city / region
+  score             – relevance score (float)
+  event_data        – (optional) object with:
+                        event_type  : funding | acquisition | ipo | merger |
+                                      partnership | product_launch | expansion |
+                                      layoffs | other
+                        amount      : dollar/share amount or null
+                        round       : funding round label or null
+                        date        : date string or null
+                        summary     : 1-2 sentence factual summary (no PII)
+                        source_url  : source article URL or null
+  linkedin_profile  – (optional) object returned by linkedin_profile_lookup.
+                      Pass it through EXACTLY as received. Contains:
+                        description    : company overview
+                        headquarters   : HQ city and country
+                        industry       : industry category
+                        company_size   : employee count or range
+                        specialties    : list of focus areas
+                        founded_year   : year founded (integer)
+                        website        : company website URL
+                        recent_updates : summary of recent posts
