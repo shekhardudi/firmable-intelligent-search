@@ -3,7 +3,7 @@
 An AI-powered company search platform that automatically classifies queries and
 routes them through the optimal search strategy: lexical (BM25), semantic
 (kNN vector), or agentic (LLM with live web search). Built for a dataset of
-**7 million companies** with sub-200 ms p50 latency.
+**7 million companies** .
 
 ---
 
@@ -82,7 +82,7 @@ User Query
 
 - Docker & Docker Compose
 - An OpenAI API key (`OPENAI_API_KEY`)
-- *(optional)* Tavily API key for agentic web search
+- Tavily API key (`TAVILY_API_KEY`)for agentic web search
 
 ### Run with Docker Compose
 
@@ -115,7 +115,7 @@ Docker Compose spins up all 9 services automatically:
 ### Ingest Data
 
 After services are up, ingest the company dataset:
-
+Download the dataset from here - [7 million company dataset](https://www.kaggle.com/datasets/peopledatalabssf/free-7-million-company-dataset/code/data)
 ```bash
 cd data-pipeline
 python3 -m venv .venv && source .venv/bin/activate
@@ -218,6 +218,7 @@ All search traffic flows through a single intelligent endpoint that classifies
 and routes automatically.
 
 ### `POST /api/search/intelligent`
+**Mock Examples**
 
 **Request:**
 
@@ -312,7 +313,6 @@ company suffixes (Inc, Ltd, GmbH, Pty Ltd, etc.).
 - OpenSearch BM25 with configurable field boosts (`name: 2.0`, `domain: 2.0`)
 - Phrase boost on exact name matches (`name_phrase_boost: 10.0`)
 - Popularity boost: `score × (1 + factor × log(1 + employee_count))`
-- Latency: ~45 ms p50
 
 ### Semantic (kNN + RRF)
 
@@ -322,7 +322,6 @@ Triggered for conceptual, natural-language queries ("AI startups in Europe").
 - Searches the `vector_embedding` field (HNSW, FAISS engine, fp16 scalar quantisation)
 - Configurable mode: pure `knn` or hybrid `rrf` (Reciprocal Rank Fusion merging BM25 + kNN)
 - Classifier-extracted filters (country, industry, year, size) applied as OpenSearch post-filters
-- Latency: ~250 ms p50
 
 ### Agentic (LLM + Tools)
 
@@ -332,7 +331,7 @@ Series B funding recently").
 - LangChain tool-calling agent powered by GPT-4o
 - Tools: `web_search` (Tavily), `lookup_names` (OpenSearch), `linkedin_profile`, `submit_results`
 - Extracts company names from web results, resolves against OpenSearch index
-- Latency: ~2–5 s
+- Latency: ~2–8 s
 
 ---
 
@@ -400,7 +399,6 @@ CloudWatch Logs via `awslogs` driver. No code changes between environments.
 
 | Target     | Stack                    | Guide                                                        |
 |------------|--------------------------|--------------------------------------------------------------|
-| Local dev  | Docker Compose           | [QUICKSTART.md](QUICKSTART.md)                               |
 | AWS Demo   | Terraform + ECS Fargate  | [docs/ARCHITECTURE_DEMO.md](docs/ARCHITECTURE_DEMO.md)       |
 | AWS Prod   | Terraform + ECS (hardened)| [docs/ARCHITECTURE_PROD.md](docs/ARCHITECTURE_PROD.md)       |
 
@@ -412,38 +410,73 @@ Search behaviour is tunable via `backend/search_config.yaml`:
 
 ```yaml
 rrf:
-  k: 60                          # RRF constant
-  knn_k: 100                     # kNN candidates per query
-  fetch_multiplier: 4            # Over-fetch factor
+  k: 60
+  knn_k: 100
+  fetch_multiplier: 4
 
 semantic:
-  mode: "knn"                    # "knn" (pure vector) or "rrf" (hybrid)
+  # Search mode for the semantic strategy.
+  #   "knn" — pure k-NN vector search only (faster, no BM25 leg)
+  #   "rrf" — hybrid Reciprocal Rank Fusion merging BM25 + k-NN (better precision)
+  mode: "knn"
+
+field_boosts:
+  defaults:                 # SemanticSearchStrategy._DEFAULT_FIELD_BOOSTS
+    name: 2.0
+    domain: 1.0
+    searchable_text: 1.0
+    industry: 1.0
+    locality: 1.0
+  bm25_regular:             # RegularSearchStrategy _build_bm25_query field weights
+    name: 2.0
+    domain: 2.0
+    searchable_text: 1.0
+    industry: 1.0
+    locality: 1.0
+    name_phrase_boost: 10.0
+    # Popularity boost: multiplies BM25 score by (1 + factor * log(1 + employee_count)).
+    # Set to 0 to disable. Typical range: 0.1 – 0.5
+    popularity_boost_factor: 2.0
+
+cache:
+  embedding_maxsize: 512
+  classifier_maxsize: 256
 
 embedding:
+  # Sentence-transformers model name or local path.
+  # Override with EMBEDDING_MODEL env var or by editing here.
   model: all-MiniLM-L6-v2
+  # Vector dimension produced by the model.
   dimension: 384
+  # Asymmetric retrieval prefix added to queries (not documents).
+  # Set to empty string "" for symmetric models (e.g. all-MiniLM).
+  query_prefix: "Represent this sentence for searching relevant passages: "
 
 agentic:
+  # LLM model used by the tool-calling agent.
+  # Any OpenAI chat model that supports tool/function calling:
+  #   gpt-4o-mini  (fast, cheap, good for most queries)
+  #   gpt-4o       (best reasoning, use for complex multi-step queries)
+  #   gpt-4-turbo  (balanced)
   model: "gpt-4o"
+  # Maximum agent iterations before giving up
   agent_max_iterations: 5
+  # Maximum company names the LLM may return per extraction call
+  max_company_names: 20
+  # Token budget for the LLM event-extraction call
+  llm_max_tokens: 1200
+  # OpenSearch candidates to fetch per resolved company name
+  resolve_per_name: 5
+  # Minimum OpenSearch score to accept a resolved company (avoids false matches)
+  min_resolve_score: 0.5
+  # Tavily web-search max results (only used when TAVILY_API_KEY is set)
+  tavily_max_results: 10
+  # Tavily HTTP request timeout in seconds
+  tavily_timeout_s: 8
+
 ```
 
 Environment variables are documented in [.env.example](.env.example).
-
----
-
-## Performance
-
-Benchmarked on 7 M company dataset, single OpenSearch node (r6g.large):
-
-| Query Type   | Latency p50 | Latency p99 | Throughput |
-|--------------|-------------|-------------|------------|
-| Regular      | 45 ms       | 150 ms      | 200+ RPS   |
-| Semantic     | 250 ms      | 800 ms      | 40+ RPS    |
-| Agentic      | 2 000 ms    | 5 000 ms    | 10 RPS     |
-| **Combined** | —           | —           | **60 RPS** |
-
-See [SCALING.md](SCALING.md) for capacity planning and 10× growth strategy.
 
 ---
 
@@ -466,7 +499,6 @@ caching, configuration, embedding service, and API routes.
 - [Local Architecture](docs/ARCHITECTURE_LOCAL.md) — Docker Compose stack and port map
 - [Demo Architecture](docs/ARCHITECTURE_DEMO.md) — Single-AZ AWS (Terraform + ECS)
 - [Production Architecture](docs/ARCHITECTURE_PROD.md) — Multi-AZ hardened AWS deployment
-- [Scaling Strategy](SCALING.md) — Performance targets and 10× growth plan
 
 ---
 
