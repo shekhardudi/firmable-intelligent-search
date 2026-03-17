@@ -438,7 +438,3 @@ Every 24 hours:
 
 ---
 
-## See Also
-- [API Documentation](API.md)
-- [Architecture Details](ARCHITECTURE.md)
-- [Deployment Guide](DEPLOYMENT.md)

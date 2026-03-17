@@ -24,21 +24,21 @@ services:
     networks:
       - search-network
 
-  # opensearch-dashboards:
-  #   image: opensearchproject/opensearch-dashboards:latest
-  #   container_name: firmable-opensearch-dashboards
-  #   ports:
-  #     - 5601:5601
-  #   expose:
-  #     - "5601"
-  #   environment:
-  #     OPENSEARCH_HOSTS: '["https://firmable-opensearch-node1:9200"]'
-  #     opensearch.ssl.verificationMode: none
-  #     opensearch.username: admin
-  #     opensearch.password: MySecurePassword123!
-  #     OPENSEARCH_INITIAL_ADMIN_PASSWORD: MySecurePassword123!
-  #   networks:
-  #     - search-network
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:latest
+    container_name: firmable-opensearch-dashboards
+    ports:
+      - 5601:5601
+    expose:
+      - "5601"
+    environment:
+      OPENSEARCH_HOSTS: '["https://firmable-opensearch-node1:9200"]'
+      opensearch.ssl.verificationMode: none
+      opensearch.username: admin
+      opensearch.password: MySecurePassword123!
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: MySecurePassword123!
+    networks:
+      - search-network
 
 
   # =========================================================================
@@ -63,29 +63,29 @@ services:
   # =========================================================================
   # FastAPI Backend
   # =========================================================================
-  # backend:
-  #   build:
-  #     context: ./backend
-  #     dockerfile: Dockerfile
-  #   container_name: firmable-backend
-  #   ports:
-  #     - "8000:8000"
-  #   environment:
-  #     - ENVIRONMENT=development
-  #     - LOG_LEVEL=INFO
-  #     - OPENSEARCH_HOST=opensearch-node1
-  #     - OPENSEARCH_PORT=9200
-  #     - OPENSEARCH_PASSWORD=${OPENSEARCH_PASSWORD:-MySecurePassword123!}
-  #     - REDIS_URL=redis://redis:6379/0
-  #     - OPENAI_API_KEY=${OPENAI_API_KEY}
-  #     - TAVILY_API_KEY=${TAVILY_API_KEY:-}
-  #     - OTLP_ENDPOINT=http://otel-collector:4317
-  #     - OTEL_SERVICE_NAME=firmable-search
-  #   volumes:
-  #     - ./backend:/app
-  #   networks:
-  #     - search-network
-  #   command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: firmable-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
+      - OPENSEARCH_HOST=opensearch-node1
+      - OPENSEARCH_PORT=9200
+      - OPENSEARCH_PASSWORD=${OPENSEARCH_PASSWORD:-MySecurePassword123!}
+      - REDIS_URL=redis://redis:6379/0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - OTLP_ENDPOINT=http://otel-collector:4317
+      - OTEL_SERVICE_NAME=firmable-search
+    volumes:
+      - ./backend:/app
+    networks:
+      - search-network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
   
   # =========================================================================
   # React Frontend

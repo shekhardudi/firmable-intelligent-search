@@ -1,935 +1,475 @@
-# Firmable Intelligent Company Search System
+# Firmable — Intelligent Company Search
 
-A production-ready, AI-powered company search platform designed to handle intelligent queries with semantic understanding, agentic search capabilities, and significant scale (60 RPS general search, 30 RPS AI operations).
-
-## 📋 Table of Contents
-- [Architecture Overview](#architecture-overview)
-- [Technology Stack](#technology-stack)
-- [Quick Start](#quick-start)
-- [Detailed Setup Instructions](#detailed-setup-instructions)
-- [API Documentation](#api-documentation)
-- [Search Features](#search-features)
-- [Scaling Strategy](#scaling-strategy)
-- [Deployment Guide](#deployment-guide)
+An AI-powered company search platform that automatically classifies queries and
+routes them through the optimal search strategy: lexical (BM25), semantic
+(kNN vector), or agentic (LLM with live web search). Built for a dataset of
+**7 million companies** with sub-200 ms p50 latency.
 
 ---
 
-## 🏗️ Architecture Overview
+## How It Works
 
-### System Architecture Diagram
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Frontend (Web UI)                       │
-│              (React/HTML Dashboard with Filters)                │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-        ┌────────────────┴─────────────────┐
-        │                                  │
-┌───────▼──────────────────────┐  ┌───────▼──────────────────────┐
-│    FastAPI Backend (REST)    │  │    WebSocket Upgrades        │
-│  - Query Parser & Handler    │  │  (Real-time Results)         │
-│  - Filter Processing         │  │                              │
-└───────┬──────────────────────┘  └──────────────────────────────┘
-        │
-        ├──────────────┬──────────────┬──────────────┐
-        │              │              │              │
-   ┌────▼────┐  ┌─────▼─────┐  ┌────▼─────┐ ┌─────▼──────┐
-   │ OpenSearch  │ LLM Query  │  │Semantic  │ │ Agentic    │
-   │ (Structured)│ Classifier │  │ Encoder  │ │ Search     │
-   │   Index    │ (FastAPI)  │  │(OpenAI)  │ │ (Claude)   │
-   └────┬────┘  └─────┬─────┘  └────┬─────┘ └─────┬──────┘
-        │              │             │              │
-        └──────────────┴─────────────┴──────────────┘
-                       │
-            ┌──────────┴──────────┐
-            │                     │
-      ┌─────▼────────┐    ┌──────▼────────┐
-      │ PostgreSQL   │    │   Redis Cache  │
-      │ (User Tags)  │    │  (Results &    │
-      │              │    │   Queries)     │
-      └──────────────┘    └────────────────┘
-
-        ┌────────────────────────────────┐
-        │   Observability Stack          │
-        │  - Prometheus Metrics          │
-        │  - Structured JSON Logging     │
-        │  - Distributed Tracing         │
-        └────────────────────────────────┘
+User Query
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│  Regex Pre-Classifier  (zero-cost, deterministic)   │
+│  Catches obvious patterns: quoted names, domains,   │
+│  company suffixes (Inc, Ltd, GmbH, …)               │
+└──────────────┬───────────────────────┬──────────────┘
+               │ matched → REGULAR     │ not matched
+               ▼                       ▼
+          BM25 Search       ┌────────────────────────┐
+                            │  LLM Intent Classifier │
+                            │  (GPT-4o-mini via      │
+                            │   Instructor)          │
+                            └───┬──────────┬─────────┘
+                                │          │
+              ┌─────────────────┘          └──────────────────┐
+              ▼                                               ▼
+     Semantic Search                                  Agentic Search
+     (kNN + BM25 hybrid                              (LangChain agent
+      via Reciprocal Rank                              + Tavily web search
+      Fusion)                                          + LinkedIn enrichment)
+              │                                               │
+              └──────────────┬────────────────────────────────┘
+                             ▼
+                   Normalise, paginate, cache
+                             │
+                             ▼
+                   JSON response + headers
+                   (X-Trace-ID, X-Search-Logic,
+                    X-Confidence, X-Response-Time-MS)
 ```
 
-### Data Flow
-1. **User Query** → Frontend captures search intent
-2. **Query Understanding** → LLM classifies intent, extracts parameters
-3. **Search Routing** → Determines best search strategy:
-   - **Structured Search**: OpenSearch filters + BM25
-   - **Semantic Search**: Vector embeddings + similarity
-   - **Agentic Search**: Multi-step reasoning with external data
-4. **Result Aggregation** → Combines results with ranking
-5. **User Tagging** → Optional personalization layer
+---
+
+## Features
+
+- **Three-tier search** — Regular (BM25), Semantic (384-dim kNN + RRF), Agentic (LLM + web tools)
+- **Automatic intent classification** — regex fast path + GPT-4o-mini with structured output via [Instructor](https://github.com/jxnl/instructor)
+- **Filter extraction** — classifier extracts country, industry, size, year range from natural language
+- **User-applied filters** — UI filters merge with classifier filters (user selection wins on conflict)
+- **PII guard** — blocks queries containing emails, phone numbers, card numbers, SSNs
+- **Circuit breaker** — graceful degradation when OpenAI or OpenSearch is unhealthy
+- **Caching** — Redis with 10 s TTL for query results and classifier responses; in-memory fallback
+- **Full observability** — OpenTelemetry traces/metrics/logs — zero code change between local and AWS
+- **Faceted search** — basic search endpoint returns industry, country, size, year aggregations
 
 ---
 
-## 🛠️ Technology Stack
+## Tech Stack
 
-### Core Search
-- **OpenSearch** (v2.x) - Primary search engine
-  - Full-text indexing for company names
-  - Structured queries for filters
-  - Vector search support (8K dimension embeddings)
-  - Horizontal scaling out-of-the-box
-
-### AI/LLM Layer
-- **Azure OpenAI API** or **OpenAI GPT-4**
-  - Query classification and entity extraction
-  - Semantic embeddings generation
-  - Response augmentation
-
-- **Claude API** (Optional)
-  - Agentic search orchestration
-  - Complex reasoning over multiple data sources
-
-### Backend
-- **FastAPI** (Python 3.11+)
-  - Async/await for concurrency (60+ RPS)
-  - Built-in request validation (Pydantic)
-  - Automatic API documentation (OpenAPI/Swagger)
-
-### Frontend
-- **React 18** + TypeScript
-  - Component-based architecture
-  - Real-time search feedback
-  - Filter UI system
-
-- **Vite** (Build tool)
-  - Fast HMR development
-  - Optimized production builds
-
-### Data & Caching
-- **PostgreSQL** (User tags, search history)
-- **Redis** (Query caching, session management)
-
-### Observability
-- **Prometheus** (Metrics)
-- **Python Logging** (Structured JSON logs)
-- **OpenTelemetry** (Distributed tracing)
-
-### Infrastructure
-- **Docker** + **Docker Compose** (Local development)
-- **Kubernetes** (Production scaling)
-- **GitHub Actions** (CI/CD)
+| Layer             | Technology                                                         |
+|-------------------|--------------------------------------------------------------------|
+| Frontend          | React 18, TypeScript, Vite                                         |
+| Backend           | FastAPI, Python 3.12, Uvicorn                                      |
+| Search Engine     | OpenSearch 2.x (BM25 + kNN HNSW, fp16 scalar quantisation, FAISS) |
+| Embeddings        | SentenceTransformer `all-MiniLM-L6-v2` (384 dimensions)           |
+| LLM (classifier)  | OpenAI GPT-4o-mini via Instructor (structured Pydantic output)    |
+| LLM (agentic)    | OpenAI GPT-4o via LangChain tool-calling agent                     |
+| Web Search        | Tavily API (used by agentic strategy)                              |
+| Cache             | Redis 7 Alpine — 10 s TTL                                         |
+| Observability     | OpenTelemetry → Jaeger + Prometheus + Grafana (local)              |
+|                   | OpenTelemetry → ADOT sidecar → X-Ray + CloudWatch (AWS)           |
+| Infrastructure    | Docker Compose (local) · Terraform + ECS Fargate (AWS)             |
 
 ---
 
-## ⚡ Quick Start (5 minutes)
 
 ### Prerequisites
-```bash
-# Required
+
 - Docker & Docker Compose
-- Python 3.11+
-- Node.js 18+
-- Git
+- An OpenAI API key (`OPENAI_API_KEY`)
+- *(optional)* Tavily API key for agentic web search
 
-# Optional (for local development without Docker)
-- OpenSearch running locally
-- PostgreSQL running locally
-- Redis running locally
+### Run with Docker Compose
+
+```bash
+git clone https://github.com/shekhardudi/firmable-intelligent-search.git
+cd firmable-intelligent-search
+
+# Configure environment
+cp .env.example backend/.env
+cp .env.example data-pipeline/.env
+# Edit both .env files — set OPENAI_API_KEY (and optionally TAVILY_API_KEY)
+
+# Start everything (OpenSearch, Redis, Backend, Frontend, Observability)
+docker compose up -d
 ```
 
-### 1. Clone & Navigate
+Docker Compose spins up all 9 services automatically:
+
+| Service               | URL                          |
+|-----------------------|------------------------------|
+| **Frontend (UI)**     | http://localhost:5173         |
+| **Backend (API)**     | http://localhost:8000         |
+| **Swagger Docs**      | http://localhost:8000/docs    |
+| **OpenSearch**        | https://localhost:9200        |
+| **OpenSearch Dashboards** | http://localhost:5601     |
+| **Jaeger (Traces)**   | http://localhost:16686        |
+| **Prometheus**        | http://localhost:9090         |
+| **Grafana**           | http://localhost:3001 (admin/admin) |
+
+### Ingest Data
+
+After services are up, ingest the company dataset:
+
 ```bash
-cd /Users/lucifer/Documents/ai-workspace/firmable-intelligent-search
-```
-
-### 2. Environment Setup
-```bash
-# Create .env file in root directory
-cat > .env << 'EOF'
-# OpenAI/Azure OpenAI
-OPENAI_API_KEY=your_api_key_here
-OPENAI_API_BASE=https://api.openai.com/v1
-OPENAI_MODEL=gpt-4-turbo
-
-# OpenSearch
-OPENSEARCH_HOST=localhost
-OPENSEARCH_PORT=9200
-OPENSEARCH_USER=admin
-OPENSEARCH_PASSWORD=MySecurePassword123!
-
-# PostgreSQL
-DATABASE_URL=postgresql://firmable_user:password123@localhost:5432/firmable_search
-
-# Redis
-REDIS_URL=redis://localhost:6379/0
-
-# App Settings
-LOG_LEVEL=INFO
-ENVIRONMENT=development
-EOF
-```
-
-### 3. Start Services (Docker Compose)
-```bash
-docker-compose up -d
-```
-
-This starts:
-- OpenSearch on port 9200
-- PostgreSQL on port 5432
-- Redis on port 6379
-
-### 4. Install & Run Backend
-```bash
-cd backend
+cd data-pipeline
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+python data_ingestion_pipeline.py
 ```
 
-✅ API available at: http://localhost:8000
-
-### 5. Install & Run Frontend
-```bash
-cd ../frontend
-npm install
-npm run dev
-```
-
-✅ UI available at: http://localhost:5173
-
-### 6. Ingest Sample Data
-```bash
-cd ../data-pipeline
-python ingest_sample_data.py
-```
-
-✅ Sample data (10,000 companies) indexed in OpenSearch
+Open **http://localhost:5173** and start searching.
 
 ---
 
-## 📚 Detailed Setup Instructions
+## Project Structure
 
-### Step 1: Project Structure Verification
 ```
 firmable-intelligent-search/
-├── backend/                      # FastAPI application
+├── backend/
 │   ├── app/
-│   │   ├── api/                 # API endpoints
-│   │   │   ├── routes.py
-│   │   │   ├── search.py
-│   │   │   └── tags.py
-│   │   ├── services/            # Business logic
-│   │   │   ├── search_service.py
-│   │   │   ├── query_classifier.py
-│   │   │   ├── semantic_search.py
-│   │   │   ├── opensearch_service.py
-│   │   │   ├── llm_service.py
-│   │   │   └── tagging_service.py
-│   │   ├── models/              # Data models
-│   │   │   ├── company.py
-│   │   │   ├── search.py
-│   │   │   └── tag.py
-│   │   ├── utils/               # Utilities
-│   │   │   ├── logging_config.py
-│   │   │   ├── cache.py
-│   │   │   └── metrics.py
-│   │   ├── main.py              # FastAPI app initialization
-│   │   └── config.py            # Configuration management
-│   ├── tests/                   # Unit & integration tests
+│   │   ├── api/
+│   │   │   └── routes.py              # All API endpoints
+│   │   ├── models/
+│   │   │   └── search.py              # Pydantic request/response models
+│   │   ├── services/
+│   │   │   ├── orchestrator.py        # Query routing (regex → LLM → strategy)
+│   │   │   ├── intent_classifier.py   # GPT-4o-mini intent classification
+│   │   │   ├── search_strategies.py   # Regular / Semantic / Agentic strategies
+│   │   │   ├── agent_service.py       # LangChain agentic agent + tools
+│   │   │   ├── tool_service.py        # Agentic tool definitions
+│   │   │   ├── embedding_service.py   # SentenceTransformer embeddings
+│   │   │   ├── opensearch_service.py  # OpenSearch client
+│   │   │   ├── cache_service.py       # Redis cache (graceful fallback)
+│   │   │   ├── circuit_breaker.py     # Circuit breaker (CLOSED/OPEN/HALF_OPEN)
+│   │   │   ├── pii_service.py         # PII detection
+│   │   │   ├── search_service.py      # Basic/faceted search
+│   │   │   └── prompt_loader.py       # Load prompt templates from disk
+│   │   ├── prompts/
+│   │   │   ├── intent_classifier_system.txt
+│   │   │   ├── agent_system.txt
+│   │   │   ├── agent_extraction.txt
+│   │   │   └── agent_linkedin_extraction.txt
+│   │   ├── observability/
+│   │   │   ├── logging.py             # structlog + JSON
+│   │   │   ├── tracing.py             # OTel tracing
+│   │   │   ├── metrics.py             # OTel metrics
+│   │   │   └── events.py              # Custom event logging
+│   │   ├── utils/
+│   │   │   └── cache.py               # BoundedDict LRU
+│   │   ├── config.py                  # Pydantic Settings (env vars + YAML)
+│   │   └── main.py                    # FastAPI app, lifespan, middleware
+│   ├── tests/                         # pytest suite
+│   ├── search_config.yaml             # Search tuning (RRF, boosts, agentic)
 │   ├── requirements.txt
-│   ├── Dockerfile
-│   └── pytest.ini
-├── frontend/                    # React application
+│   └── Dockerfile
+├── frontend/
 │   ├── src/
+│   │   ├── App.tsx                    # Main component (search + AI thinking panel)
+│   │   ├── App.css
+│   │   ├── main.tsx
 │   │   ├── components/
 │   │   │   ├── SearchBar.tsx
 │   │   │   ├── FilterPanel.tsx
-│   │   │   ├── ResultsList.tsx
-│   │   │   └── TagManager.tsx
-│   │   ├── services/
-│   │   │   └── api.ts
-│   │   ├── hooks/
-│   │   │   └── useSearch.ts
-│   │   ├── App.tsx
-│   │   └── index.css
+│   │   │   └── ResultsList.tsx
+│   │   └── services/
+│   │       └── api.ts                 # Axios client + TypeScript interfaces
+│   ├── index.html
 │   ├── package.json
+│   ├── vite.config.ts
 │   └── Dockerfile
-├── data-pipeline/              # Data ingestion
-│   ├── ingest_sample_data.py
-│   ├── ingest_full_dataset.py
-│   ├── utils.py
-│   └── requirements.txt
-├── infrastructure/             # Infrastructure as Code
-│   ├── docker-compose.yml
-│   ├── kubernetes/
-│   │   ├── deployment.yaml
-│   │   ├── service.yaml
-│   │   └── configmap.yaml
-│   └── monitoring/
-│       └── prometheus.yml
-├── docs/                       # Documentation
-│   ├── SCALING.md
-│   ├── API.md
-│   ├── DEPLOYMENT.md
-│   └── ARCHITECTURE.md
-├── .env.example
-├── .gitignore
-├── docker-compose.yml          # Main compose file
+├── data-pipeline/
+│   ├── data_ingestion_pipeline.py     # ETL: CSV → clean → embed → bulk index
+│   ├── ingest_config.yaml             # Chunk sizes, model, dimensions
+│   ├── index_mapping.json             # OpenSearch mapping (384-dim kNN)
+│   ├── companies_sorted.csv           # 7 M company dataset
+│   ├── country_taxonomy.json
+│   ├── industry_taxonomy.json
+│   ├── observability.py
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── tests/
+├── infrastructure/
+│   ├── grafana/                       # Dashboard + datasource provisioning
+│   ├── otel-collector/                # Collector configs (local + AWS)
+│   ├── prometheus/                    # Scrape config
+│   └── terraform/demo/               # AWS ECS Fargate infra (Terraform)
+├── docs/
+│   ├── ARCHITECTURE_LOCAL.md
+│   ├── ARCHITECTURE_DEMO.md
+│   └── ARCHITECTURE_PROD.md
+├── docker-compose.yml                 # 9 services (full local dev stack)
+├── .env.example                       # Template for backend/.env
+├── QUICKSTART.md
+├── SCALING.md
 └── README.md
-```
-
-### Step 2: Backend Dependencies Installation
-
-```bash
-cd backend
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-**Key Dependencies:**
-- `fastapi` - Web framework
-- `opensearch-py` - OpenSearch client
-- `openai` - OpenAI API client
-- `pydantic` - Data validation
-- `sqlalchemy` - ORM for PostgreSQL
-- `redis` - Caching
-- `structlog` - Structured logging
-- `prometheus-client` - Metrics
-- `pydantic-settings` - Config management
-- `pytest` - Testing
-- `python-dotenv` - Environment variables
-
-### Step 3: Database Setup
-
-```bash
-# Create PostgreSQL user and database
-psql -U postgres -c "CREATE USER firmable_user WITH PASSWORD 'password123';"
-psql -U postgres -c "CREATE DATABASE firmable_search OWNER firmable_user;"
-
-# Run migrations (if using Alembic)
-cd backend
-alembic upgrade head
-```
-
-### Step 4: OpenSearch Index Creation
-
-Index schema designed for optimal search performance:
-
-```bash
-curl -X PUT "localhost:9200/companies" \
-  -H "Content-Type: application/json" \
-  -d @data-pipeline/index_mapping.json
-```
-
-Index configuration includes:
-- **Name field**: Full-text with edge-grams for autocomplete
-- **Industry field**: Keyword for exact matching + text for fuzzy
-- **Location fields**: Hierarchical (country, locality) for faceting
-- **Year founded**: Numeric for range queries
-- **Vector embeddings**: Dense vectors (8192 dims) for semantic search
-- **Text fields**: Analyzed with synonyms for semantic equivalence
-
-### Step 5: LLM Integration Setup
-
-#### Option A: Azure OpenAI (Recommended for enterprise)
-```python
-# backend/.env
-OPENAI_API_KEY=your-azure-api-key
-OPENAI_API_BASE=https://your-resource.openai.azure.com/
-OPENAI_API_VERSION=2024-02-15-preview
-OPENAI_DEPLOYMENT_NAME=gpt-4-deployment
-```
-
-#### Option B: OpenAI
-```python
-# backend/.env
-OPENAI_API_KEY=sk-xxx
-OPENAI_MODEL=gpt-4-turbo
-```
-
-### Step 6: Test the System
-
-```bash
-# Backend tests
-cd backend
-pytest tests/ -v
-
-# Test search endpoint
-curl http://localhost:8000/docs  # Swagger UI
 ```
 
 ---
 
-## 🔍 API Documentation
+## API
 
-### 1. **Basic Company Search**
-```http
-GET /api/search/companies
-```
+All search traffic flows through a single intelligent endpoint that classifies
+and routes automatically.
 
-**Query Parameters:**
-- `q` (string) - Free text search query
-- `industry` (array) - Filter by industry
-- `country` (string) - Filter by country
-- `city` (string) - Filter by city
-- `year_from` (int) - Founding year minimum
-- `year_to` (int) - Founding year maximum
-- `size` (array) - Company size range [small, medium, large]
-- `page` (int) - Page number (default: 1)
-- `limit` (int) - Results per page (default: 20, max: 100)
-- `sort` (string) - relevance|name|size|year
+### `POST /api/search/intelligent`
 
-**Example Request:**
-```bash
-curl "http://localhost:8000/api/search/companies?q=tech&country=US&industry=Information%20Technology&limit=10"
-```
+**Request:**
 
-**Response:**
 ```json
 {
-  "total": 1247,
+  "query": "sustainable energy companies in Germany with 50-200 employees",
+  "limit": 20,
   "page": 1,
-  "limit": 10,
-  "results": [
-    {
-      "id": "5872184",
-      "name": "IBM",
-      "domain": "ibm.com",
-      "industry": "Information Technology and Services",
-      "country": "United States",
-      "locality": "New York, New York",
-      "year_founded": 1911,
-      "size_range": "10001+",
-      "employees_estimate": 274047,
-      "linkedin_url": "linkedin.com/company/ibm",
-      "relevance_score": 0.95
-    }
-  ],
-  "facets": {
-    "industries": [
-      {"name": "Information Technology", "count": 450},
-      {"name": "Financial Services", "count": 200}
-    ],
-    "countries": [
-      {"name": "United States", "count": 800},
-      {"name": "India", "count": 200}
-    ]
+  "include_reasoning": true,
+  "filters": {
+    "country": "Germany",
+    "size_range": "51-200"
   }
 }
 ```
 
-### 2. **Intelligent Query Search** (AI-Powered)
-```http
-POST /api/search/intelligent
-```
-
-**Request Body:**
-```json
-{
-  "query": "tech companies in california founded in last 5 years with 100-500 employees",
-  "llm_enhanced": true,
-  "semantic_search": true
-}
-```
-
 **Response:**
+
 ```json
 {
-  "query_understanding": {
-    "intent": "filtered_company_search",
-    "entities": {
-      "industries": ["information technology", "software"],
-      "locations": ["California", "United States"],
-      "year_range": [2021, 2026],
-      "employee_range": [100, 500]
+  "query": "sustainable energy companies in Germany with 50-200 employees",
+  "results": [
+    {
+      "id": "abc123",
+      "name": "SolarEdge Technologies",
+      "domain": "solaredge.com",
+      "industry": "Renewables & Environment",
+      "country": "Germany",
+      "locality": "Munich, Bavaria",
+      "relevance_score": 0.91,
+      "search_method": "semantic",
+      "ranking_source": "knn",
+      "matching_reason": "Semantic match on sustainable energy + location filter Germany",
+      "year_founded": 2006,
+      "size_range": "51-200",
+      "current_employee_estimate": 150
+    }
+  ],
+  "metadata": {
+    "trace_id": "a1b2c3d4e5f6",
+    "query_classification": {
+      "category": "semantic",
+      "confidence": 0.92,
+      "reasoning": "Natural language query about a concept with filters"
     },
-    "confidence": 0.92
+    "search_execution": {
+      "strategy": "SemanticSearchStrategy",
+      "opensearch_took_ms": 85,
+      "score_range": { "min": 0.72, "max": 0.91 }
+    },
+    "total_results": 20,
+    "response_time_ms": 245,
+    "page": 1,
+    "limit": 20
   },
-  "results": [
-    {
-      "id": "98765",
-      "name": "TechStartup Inc",
-      "domain": "techstartup.com",
-      "matching_reason": "Matches all criteria: tech (industry), California (location), 2023 (founded), 250 employees"
-    }
-  ],
-  "search_time_ms": 245
+  "status": "success"
 }
 ```
 
-### 3. **Semantic Search** (Vector-based)
-```http
-POST /api/search/semantic
-```
+**Response Headers:**
 
-**Request Body:**
+| Header               | Example                | Description                         |
+|----------------------|------------------------|-------------------------------------|
+| `X-Trace-ID`        | `a1b2c3d4e5f6`         | Request trace ID (Jaeger / X-Ray)   |
+| `X-Search-Logic`    | `Semantic-Hybrid-RRF`  | Search method used                  |
+| `X-Confidence`      | `0.92`                 | Classifier confidence               |
+| `X-Response-Time-MS`| `245`                  | Total response time in ms           |
+| `X-Total-Results`   | `20`                   | Result count                        |
+
+
+
+### `GET /api/search/health`
+
 ```json
-{
-  "query": "software companies similar to Microsoft",
-  "top_k": 20
-}
+{ "status": "healthy", "service": "search-orchestrator", "version": "2.0.0" }
 ```
 
-**Response:**
-```json
-{
-  "results": [
-    {
-      "name": "Google",
-      "similarity_score": 0.89,
-      "reason": "Similar business model, scale, and industry"
-    }
-  ]
-}
-```
+### Interactive Docs
 
-### 4. **Agentic Search** (Multi-step reasoning)
-```http
-POST /api/search/agentic
-```
-
-**Request Body:**
-```json
-{
-  "query": "Find companies that announced funding in the last 2 months and operate in fintech",
-  "max_steps": 5
-}
-```
-
-**Response:**
-```json
-{
-  "reasoning_steps": [
-    {
-      "step": 1,
-      "action": "search_crunchbase_api",
-      "result": "Found 23 companies with recent funding announcements"
-    },
-    {
-      "step": 2,
-      "action": "filter_by_industry",
-      "result": "Narrowed to 18 fintech companies"
-    }
-  ],
-  "results": [
-    {
-      "company_name": "Stripe",
-      "funding_source": "Series D",
-      "funding_date": "2024-01-15"
-    }
-  ]
-}
-```
-
-### 5. **User Tags Management**
-```http
-POST /api/tags
-```
-
-**Request Body:**
-```json
-{
-  "tag_name": "potential-partners",
-  "companies": ["5872184", "4425416"],
-  "description": "Companies we should partner with"
-}
-```
-
-**Response:**
-```json
-{
-  "tag_id": "tag_123",
-  "created_at": "2024-03-12T10:30:00Z",
-  "companies_tagged": 2
-}
-```
+- Swagger UI: http://localhost:8000/docs
+- ReDoc: http://localhost:8000/redoc
 
 ---
 
-## 🎯 Search Features
+## Search Strategies
 
-### Feature 1: Query Understanding
-- **NLP-based Intent Classification**: Distinguishes between:
-  - Simple filters: "software companies in US"
-  - Range queries: "companies founded 1990-2000"
-  - Semantic: "tech leaders like FAANG"
-  - Complex: "well-funded startups in blockchain"
+### Regular (BM25)
 
-**Implementation:**
-```python
-# Query classification using LLM
-classifier = QueryClassifier()
-intent = classifier.classify("tech companies in california")
-# Returns: {intent: "filtered_search", filters: {industry, location}}
-```
+Triggered for exact company lookups — quoted names, domain lookups, names with
+company suffixes (Inc, Ltd, GmbH, Pty Ltd, etc.).
 
-### Feature 2: Semantic Matching
-- **Vector Embeddings**: Company names + descriptions vectorized
-- **Dimension**: 8192 (for rich semantic understanding)
-- **Model**: OpenAI `text-embedding-3-large`
-- **Example**: "software company" → matches "information technology and services"
+- OpenSearch BM25 with configurable field boosts (`name: 2.0`, `domain: 2.0`)
+- Phrase boost on exact name matches (`name_phrase_boost: 10.0`)
+- Popularity boost: `score × (1 + factor × log(1 + employee_count))`
+- Latency: ~45 ms p50
 
-**Implementation:**
-```python
-# Semantic search with vector similarity
-embeddings = SemanticSearch()
-results = embeddings.search(
-    query="modern fintech startup",
-    similarity_threshold=0.75,
-    top_k=20
-)
-```
+### Semantic (kNN + RRF)
 
-### Feature 3: Agentic Search
-- **Multi-step Reasoning**: Break complex queries into steps
-- **External Data Integration**: 
-  - Crunchbase API for funding info
-  - News API for recent announcements
-  - LinkedIn data for company trends
-- **Iterative Refinement**: Query → Search → Analyze → Refine → Return
+Triggered for conceptual, natural-language queries ("AI startups in Europe").
 
-**Implementation:**
-```python
-# Agentic search with Claude
-agent = AgenticSearchAgent(
-    max_steps=5,
-    tools=["opensearch", "crunchbase_api", "news_api"]
-)
-results = agent.search("find companies with Series A funding in AI")
-```
+- Encodes query with `all-MiniLM-L6-v2` (384 dimensions)
+- Searches the `vector_embedding` field (HNSW, FAISS engine, fp16 scalar quantisation)
+- Configurable mode: pure `knn` or hybrid `rrf` (Reciprocal Rank Fusion merging BM25 + kNN)
+- Classifier-extracted filters (country, industry, year, size) applied as OpenSearch post-filters
+- Latency: ~250 ms p50
 
-### Feature 4: Smart Filtering
-- **Multi-field Filters**: 
-  - Text: name (fuzzy matching)
-  - Keyword: industry, country
-  - Numeric: year founded (range), employees
-  - Geographic: location hierarchy
-- **Faceted Search**: Real-time facet counts as you filter
+### Agentic (LLM + Tools)
 
-### Feature 5: Tagging System
-- **Personal Tags**: Create custom categories
-- **Tag Consistency**: Suggestions based on similar tags by other users
-- **Use Cases**: 
-  - Competitor tracking
-  - Lead management
-  - Relationship tracking
-  - Portfolio monitoring
+Triggered for time-sensitive or external-data queries ("companies that raised
+Series B funding recently").
+
+- LangChain tool-calling agent powered by GPT-4o
+- Tools: `web_search` (Tavily), `lookup_names` (OpenSearch), `linkedin_profile`, `submit_results`
+- Extracts company names from web results, resolves against OpenSearch index
+- Latency: ~2–5 s
 
 ---
 
-## 📊 Scaling Strategy
+## Data Pipeline
 
-### 1. Horizontal Scaling (60+ RPS)
+The ingestion pipeline (`data-pipeline/data_ingestion_pipeline.py`) processes
+company CSV data into OpenSearch with vector embeddings:
 
-**OpenSearch Scaling:**
-```yaml
-clusters:
-  primary:
-    nodes: 3                    # Minimum for HA
-    data_nodes: 6+              # Distribute data
-    shards_per_index: 12
-    replicas: 2
+1. **Load** — Read CSV (supports S3 URI or local path)
+2. **Clean** — Normalise fields, deduplicate
+3. **Enrich** — Generate `searchable_text`, map industry/country via taxonomy JSONs
+4. **Embed** — Batch-encode `searchable_text` with SentenceTransformer
+5. **Index** — Bulk-index into OpenSearch with kNN mapping
+
+```bash
+cd data-pipeline
+python data_ingestion_pipeline.py
 ```
 
-**Load Distribution:**
-```
-60 RPS → 
-├─ Read Pool (40 RPS): BM25 + filters
-├─ Semantic Pool (10 RPS): Vector similarity
-└─ LLM Pool (10 RPS): Query classification
-```
+The OpenSearch index mapping (`data-pipeline/index_mapping.json`) defines:
+- BM25 text fields with edge-ngram for autocomplete
+- `knn_vector` field: 384 dimensions, HNSW (m=16, ef_construction=128), fp16 SQ, FAISS engine
+- Keyword fields with lowercase normaliser for exact-match filters
 
-**Peak Handling:**
-- Request queuing with max wait 1s
-- Circuit breakers for dependent services
-- Fallback to cached results if LLM unavailable
+---
 
-### 2. Caching Strategy (3-tier)
+## Observability
 
-```
-L1: Redis (1 minute TTL)
-    ├─ Query results cache
-    ├─ Popular searches
-    └─ Embeddings cache
+### Local (Docker Compose)
 
-L2: OpenSearch Query Cache
-    ├─ Filter results
-    └─ Aggregations
+| Service        | Port  | Purpose                        |
+|----------------|-------|--------------------------------|
+| Jaeger         | 16686 | Distributed traces             |
+| Prometheus     | 9090  | Metrics scraping               |
+| Grafana        | 3001  | Dashboards (admin / admin)     |
+| OTel Collector | 4317  | OTLP gRPC receiver             |
 
-L3: CDN (5 minute TTL)
-    └─ Static assets + popular results
-```
+Backend → OTLP/gRPC → OTel Collector → Jaeger (traces) + Prometheus (metrics).
 
-### 3. Database Performance
+### AWS (ECS Fargate)
 
-```sql
--- Indexing strategy
-CREATE INDEX idx_company_name ON companies USING gin(to_tsvector('english', name));
-CREATE INDEX idx_industry ON companies(industry);
-CREATE INDEX idx_country_city ON companies(country, locality);
-CREATE INDEX idx_year_founded ON companies(year_founded);
+Same `OTLP_ENDPOINT=http://localhost:4317` — the ADOT sidecar runs in the same
+task network namespace. Traces → X-Ray, metrics → CloudWatch EMF, logs →
+CloudWatch Logs via `awslogs` driver. No code changes between environments.
 
--- Partitioning for large datasets
-ALTER TABLE companies PARTITION BY RANGE (year_founded);
-```
+---
 
-### 4. AI/LLM Scaling (30+ RPS)
+## Docker Compose Services
 
-**Rate Limiting:**
-```python
-# Token-based rate limiting
-limiter = RateLimiter(
-    openai_requests_per_minute=1800,  # 30 RPS = 1800 RPM
-    batch_processing=True,
-    max_tokens_per_batch=100000
-)
-```
+| # | Service               | Image                                    | Port(s)          |
+|---|----------------------|------------------------------------------|------------------|
+| 1 | OpenSearch            | opensearchproject/opensearch:latest       | 9200, 9600       |
+| 2 | OpenSearch Dashboards | opensearchproject/opensearch-dashboards   | 5601             |
+| 3 | Redis                 | redis:7-alpine                            | 6379             |
+| 4 | Backend (FastAPI)     | ./backend Dockerfile                     | 8000             |
+| 5 | Frontend (Vite)       | ./frontend Dockerfile                    | 5173             |
+| 6 | OTel Collector        | otel/opentelemetry-collector-contrib      | 4317, 4318, 8888 |
+| 7 | Prometheus            | prom/prometheus:v2.52.0                   | 9090             |
+| 8 | Jaeger                | jaegertracing/all-in-one:1.58             | 16686            |
+| 9 | Grafana               | grafana/grafana:10.4.0                    | 3001             |
 
-**Batch Processing:**
-```python
-# Batch semantic search requests
-embeddings = batch_generate_embeddings(
-    queries=batch_of_100,
-    cache_results=True,
-    parallel_workers=10
-)
-```
+---
 
-### 5. Kubernetes Deployment
+## Deployment
+
+| Target     | Stack                    | Guide                                                        |
+|------------|--------------------------|--------------------------------------------------------------|
+| Local dev  | Docker Compose           | [QUICKSTART.md](QUICKSTART.md)                               |
+| AWS Demo   | Terraform + ECS Fargate  | [docs/ARCHITECTURE_DEMO.md](docs/ARCHITECTURE_DEMO.md)       |
+| AWS Prod   | Terraform + ECS (hardened)| [docs/ARCHITECTURE_PROD.md](docs/ARCHITECTURE_PROD.md)       |
+
+---
+
+## Configuration
+
+Search behaviour is tunable via `backend/search_config.yaml`:
 
 ```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: search-backend
+rrf:
+  k: 60                          # RRF constant
+  knn_k: 100                     # kNN candidates per query
+  fetch_multiplier: 4            # Over-fetch factor
 
-spec:
-  replicas: 10                    # Handle 60 RPS per pod at 6 RPS/pod
+semantic:
+  mode: "knn"                    # "knn" (pure vector) or "rrf" (hybrid)
 
-  autoscaling:
-    minReplicas: 5
-    maxReplicas: 100
-    targetCPUUtilizationPercentage: 70
-    targetMemoryUtilizationPercentage: 80
+embedding:
+  model: all-MiniLM-L6-v2
+  dimension: 384
 
-  resources:
-    requests:
-      cpu: "500m"
-      memory: "1Gi"
-    limits:
-      cpu: "2000m"
-      memory: "4Gi"
+agentic:
+  model: "gpt-4o"
+  agent_max_iterations: 5
 ```
 
-### 6. 10x Load Planning
-
-**Current Target:** 60 RPS  
-**10x Growth:** 600 RPS
-
-**Scaling Actions:**
-1. **Horizontal**: 10x pod count (5→50 pods)
-2. **Vertical**: Increase pod resources 2x
-3. **OpenSearch**: 
-   - Expand from 6 to 20+ data nodes
-   - Increase shards per index
-   - Deploy dedicated ML nodes for vector search
-4. **Async Processing**:
-   - Queue non-critical operations
-   - Background job processing
-   - Async data indexing
-5. **Multi-region**:
-   - Geographic distribution
-   - CDN for assets
-   - Read replicas in key regions
+Environment variables are documented in [.env.example](.env.example).
 
 ---
 
-## 🚀 Deployment Guide
+## Performance
 
-### Local Development
-```bash
-# Start all services
-docker-compose -f infrastructure/docker-compose.yml up -d
+Benchmarked on 7 M company dataset, single OpenSearch node (r6g.large):
 
-# Verify
-docker-compose ps
-```
+| Query Type   | Latency p50 | Latency p99 | Throughput |
+|--------------|-------------|-------------|------------|
+| Regular      | 45 ms       | 150 ms      | 200+ RPS   |
+| Semantic     | 250 ms      | 800 ms      | 40+ RPS    |
+| Agentic      | 2 000 ms    | 5 000 ms    | 10 RPS     |
+| **Combined** | —           | —           | **60 RPS** |
 
-### Staging Deployment (Kubernetes)
-```bash
-cd infrastructure/kubernetes
-
-# Create namespace
-kubectl create namespace firmable-staging
-
-# Deploy
-kubectl apply -f deployment.yaml -n firmable-staging
-kubectl apply -f service.yaml -n firmable-staging
-kubectl apply -f configmap.yaml -n firmable-staging
-
-# Verify
-kubectl get pods -n firmable-staging
-```
-
-### Production Deployment
-See [DEPLOYMENT.md](docs/DEPLOYMENT.md) for detailed production deployment guide.
+See [SCALING.md](SCALING.md) for capacity planning and 10× growth strategy.
 
 ---
 
-## 📖 Additional Documentation
-
-- **[Scaling Guide](docs/SCALING.md)** - Detailed scaling strategies and performance benchmarks
-- **[API Reference](docs/API.md)** - Complete API endpoint documentation
-- **[Architecture Details](docs/ARCHITECTURE.md)** - Deep dive into system design
-- **[Data Pipeline](docs/DATA_PIPELINE.md)** - Dataset ingestion procedures
-
----
-
-## 🧪 Testing
+## Testing
 
 ```bash
-# Run all tests
 cd backend
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 pytest tests/ -v --cov=app
-
-# Integration tests with live services
-pytest tests/integration/ -v -m integration
-
-# Load testing
-locust -f tests/load/locustfile.py --host=http://localhost:8000
 ```
+
+Tests cover: orchestrator routing, intent classification, search strategies,
+caching, configuration, embedding service, and API routes.
 
 ---
 
-## 📱 Example Usage Scenarios
+## Architecture Docs
 
-### Scenario 1: Investor Finding Tech Startups
-```
-Query: "tech companies founded in 2023 with Series A funding in California"
-
-System Flow:
-1. LLM classifies as: complex_filtered_search
-2. Extracts: {industry: tech, year: 2023, stage: Series A, location: CA}
-3. Searches OpenSearch for matching companies
-4. Enriches with Crunchbase funding data
-5. Returns ranked results with funding details
-```
-
-### Scenario 2: Competitor Intelligence
-```
-Query: "Companies similar to Microsoft in enterprise software"
-
-System Flow:
-1. Creates embedding for Microsoft profile
-2. Semantic search finds similar companies
-3. Applies user-defined "competitors" tag
-4. Returns with industry benchmarks
-```
-
-### Scenario 3: Market Research
-```
-Query: "AI/ML companies in US with 100-1000 employees"
-
-System Flow:
-1. Parses filters: industry=AI/ML, country=US, employees=100-1000
-2. Direct OpenSearch query (fast path)
-3. Returns results with industry facets
-4. Allows user to tag for analysis
-```
+- [Local Architecture](docs/ARCHITECTURE_LOCAL.md) — Docker Compose stack and port map
+- [Demo Architecture](docs/ARCHITECTURE_DEMO.md) — Single-AZ AWS (Terraform + ECS)
+- [Production Architecture](docs/ARCHITECTURE_PROD.md) — Multi-AZ hardened AWS deployment
+- [Scaling Strategy](SCALING.md) — Performance targets and 10× growth plan
 
 ---
 
-## 🔧 Development Workflow
+## License
 
-### Making Changes
-1. **Backend**: Edit `backend/app/services/*.py` → Tests auto-run
-2. **Frontend**: Edit `frontend/src/*.tsx` → HMR reloads
-3. **Data**: Update schema in `data-pipeline/` → Re-ingest
-
-### Debugging
-```bash
-# Backend logs with full context
-tail -f logs/app.log | jq .
-
-# OpenSearch query debugging
-curl http://localhost:9200/companies/_search?pretty
-
-# Frontend network inspector
-Browser DevTools → Network tab
-```
-
----
-
-## 📊 Performance Benchmarks
-
-Tested on 7M company dataset with 12-node OpenSearch cluster:
-
-| Query Type | Latency p50 | Latency p99 | QPS Capacity |
-|------------|-------------|-------------|--------------|
-| Simple text search | 45ms | 150ms | 200+ |
-| Filtered search | 65ms | 200ms | 150+ |
-| Semantic search | 250ms | 800ms | 40+ |
-| Agentic search | 2000ms | 5000ms | 5-10 |
-
-Target: **60 QPS overall** → Achieved with query routing
-
----
-
-## 🆘 Troubleshooting
-
-**Issue**: OpenSearch returning no results
-```bash
-# Check index status
-curl http://localhost:9200/_cat/indices
-
-# Check mapping
-curl http://localhost:9200/companies/_mapping?pretty
-
-# Re-create index
-python data-pipeline/ingest_sample_data.py --reset
-```
-
-**Issue**: Slow semantic search
-```bash
-# Switch to GPU-enabled OpenSearch nodes
-# Check: docs/SCALING.md section on ML workloads
-```
-
-**Issue**: LLM rate limiting
-```bash
-# Implement exponential backoff in query_classifier.py
-# Enable caching for repeated queries
-```
-
----
-
-## 📝 Development Checklist
-
-- [x] Project structure created
-- [x] Backend framework setup (FastAPI)
-- [x] Frontend framework setup (React)
-- [x] OpenSearch integration
-- [x] LLM integration
-- [x] Query classification
-- [x] Semantic search
-- [x] User tagging
-- [x] Observability setup
-- [x] Docker configuration
-- [x] Documentation
-
----
-
-## 📄 License
 MIT
-
-## 👥 Contributing
-See CONTRIBUTING.md for guidelines
-
----
-
-**Last Updated**: March 2024  
-**Status**: Ready for Production Demo

@@ -22,58 +22,58 @@ connected via the `search-network` bridge network.
 │  ┌──────────────────────────────────────────────────────────┐                │
 │  │  Backend (FastAPI + Uvicorn, Python 3.11)  :8000         │                │
 │  │                                                          │                │
-│  │  ┌─────────────────┐  ┌──────────────────┐              │                │
+│  │  ┌─────────────────┐  ┌──────────────────┐               │                │
 │  │  │ Intent Classifier│  │ Orchestrator     │              │                │
 │  │  │ (GPT-4o-mini)    │  │ (strategy router)│              │                │
-│  │  └────────┬────────┘  └────────┬─────────┘              │                │
-│  │           │                    │                          │                │
+│  │  └────────┬────────┘  └────────┬─────────┘               │                │
+│  │           │                    │                         │                │
 │  │           │         ┌──────────┼────────────┐            │                │
 │  │           │         ▼          ▼            ▼            │                │
-│  │           │   ┌──────────┐ ┌────────┐ ┌──────────────┐  │                │
-│  │           │   │ Regular  │ │Semantic│ │   Agentic    │  │                │
-│  │           │   │ (BM25)   │ │(kNN+  │ │ (LangChain   │  │                │
-│  │           │   │          │ │ RRF)  │ │  Agent)      │  │                │
-│  │           │   └────┬─────┘ └───┬───┘ └──────┬───────┘  │                │
+│  │           │   ┌──────────┐ ┌────────┐ ┌──────────────┐   │                │
+│  │           │   │ Regular  │ │Semantic│ │   Agentic    │   │                │
+│  │           │   │ (BM25)   │ │(kNN+   │ │ (LangChain   │   │                │
+│  │           │   │          │ │ RRF)   │ │  Agent)      │   │                │
+│  │           │   └────┬─────┘ └───┬─── ┘ └──────┬───────┘   │                │
 │  │           │        │           │             │           │                │
 │  └───────────┼────────┼───────────┼─────────────┼───────────┘                │
 │              │        │           │             │                            │
-│    ┌─────────▼──────────────────────────────────▼──────┐                    │
+│    ┌─────────▼──────────────────────────────────▼────── ┐                    │
 │    │  OpenSearch (single-node)  :9200 / :9600           │                    │
 │    │  ┌────────────────────────────────────────────┐    │                    │
-│    │  │  companies index (BM25 + kNN, 768-dim)     │    │                    │
+│    │  │  companies index (BM25 + kNN, 384-dim)     │    │                    │
 │    │  └────────────────────────────────────────────┘    │                    │
 │    └────────────────────────┬───────────────────────────┘                    │
 │                             │ Kibana-style UI                                │
 │                ┌────────────▼──────────────┐                                 │
-│                │  OpenSearch Dashboards     │  :5601                         │
+│                │  OpenSearch Dashboards    │  :5601                          │
 │                └───────────────────────────┘                                 │
 │                                                                              │
 │    ┌────────────────────┐      External APIs (internet)                      │
-│    │  Redis :6379        │      ┌────────────────────────────────────┐        │
-│    │  (classifier cache) │      │  OpenAI API (classifier + agent)   │        │
+│    │  Redis :6379       │      ┌────────────────────────────────────┐        │
+│    │  (classifier cache)│      │  OpenAI API (classifier + agent)   │        │
 │    └────────────────────┘      │  Tavily Search API (agentic tool)  │        │
 │                                └────────────────────────────────────┘        │
 │                                                                              │
-│  ─── Observability ──────────────────────────────────────────────────────   │
+│  ─── Observability ──────────────────────────────────────────────────────    │ 
 │                                                                              │
 │    Backend ──OTLP gRPC──▶ OTel Collector :4317                               │
 │                                │                                             │
 │                    ┌───────────┼────────────┐                                │
 │                    ▼           ▼            ▼                                │
-│             ┌─────────┐ ┌──────────┐ ┌──────────────┐                       │
-│             │  Jaeger  │ │Prometheus│ │   Grafana    │                       │
-│             │ :16686   │ │  :9090   │ │    :3001     │                       │
-│             │(traces)  │ │(metrics) │ │(dashboards)  │                       │
-│             └─────────┘ └──────────┘ └──────────────┘                       │
+│             ┌─────────┐ ┌──────────┐ ┌──────────────┐                        │
+│             │  Jaeger │ │Prometheus│ │   Grafana    │                        │
+│             │ :16686  │ │  :9090   │ │    :3001     │                        │
+│             │(traces) │ │(metrics) │ │(dashboards)  │                        │
+│             └─────────┘ └──────────┘ └──────────────┘                        │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Port Reference
 
-| Service              | Host Port | Purpose                      |
-|----------------------|-----------|------------------------------|
-| Frontend             | 5173      | React dev server (Vite HMR)  |
+| Service              | Host Port | Purpose                       |
+|----------------------|-----------|------------------------------ |
+| Frontend             | 5173      | React dev server (Vite HMR)   |
 | Backend API          | 8000      | FastAPI / Uvicorn             |
 | OpenSearch           | 9200      | REST query & index API        |
 | OpenSearch Dashboards| 5601      | Index browser / dev UI        |
@@ -95,11 +95,11 @@ POST /api/search/intelligent
         ▼
   Orchestrator.search()
         │
-  ┌─────┴──────────────────────────────────────────────┐
+  ┌─────┴────────────────────────────────────────────── ┐
   │   Route by category                                 │
   ▼             ▼                   ▼                   │
-BM25          Hybrid              Agentic               │
-Search        kNN+BM25            LangChain             │
+BM25          Hybrid/semantic     Agentic               │
+Search        kNN+BM25/kNN        LangChain             │
 (regular)     (semantic)          Agent                 │
   │             │                   │                   │
   └─────────────┴───────────────────┘                   │

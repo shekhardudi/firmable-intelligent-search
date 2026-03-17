@@ -9,6 +9,6 @@ embedding:
   dimension: 384
 
 vector_index:
-  space_type: cosinesimil
+  space_type: innerproduct
   m: 16
   ef_construction: 128
