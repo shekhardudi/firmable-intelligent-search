@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import structlog
 from contextlib import asynccontextmanager
+import asyncio
 import time
 import uuid
 from app.config import get_settings
@@ -65,6 +66,10 @@ async def lifespan(app: FastAPI):
         opensearch = get_opensearch_service()
         is_healthy = opensearch.health_check()
         logger.info("opensearch_connection_test", healthy=is_healthy)
+        # Pre-load HNSW graph into native memory so the first kNN query
+        # doesn't time out on cold start (7M × 384-dim ≈ 5-7 GB to load).
+        if is_healthy:
+            opensearch.warmup_knn(settings.OPENSEARCH_INDEX_NAME)
     except Exception as e:
         logger.error("opensearch_initialization_failed", error=str(e))
     
@@ -108,11 +113,49 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("search_orchestrator_initialization_failed", error=str(e))
     
+    # Periodic semantic probe: a lightweight k=1 kNN query every 10 minutes
+    # to validate the full pipeline (embedding model → kNN search → results).
+    # The kNN warmup API is NOT needed here — with r6g.xlarge and
+    # knn.cache.item.expiry.enabled=false the graph stays permanently in memory.
+    async def _periodic_warmup():
+        while True:
+            await asyncio.sleep(600)  # every 10 minutes
+            try:
+                from app.services.opensearch_service import get_opensearch_service
+                from app.services.embedding_service import get_embedding_service
+                os_svc = get_opensearch_service()
+                emb_svc = get_embedding_service()
+                probe_vec = emb_svc.embed("technology companies in india")
+                probe_body = {
+                    "size": 1,
+                    "_source": ["name"],
+                    "query": {
+                        "knn": {
+                            "vector_embedding": {
+                                "vector": probe_vec,
+                                "k": 1,
+                            }
+                        }
+                    },
+                }
+                resp = os_svc.search(
+                    index=settings.OPENSEARCH_INDEX_NAME,
+                    body=probe_body,
+                    size=1,
+                )
+                hits = resp.get("hits", {}).get("total", {}).get("value", 0)
+                logger.info("semantic_warmup_probe_ok", hits=hits)
+            except Exception as exc:
+                logger.warning("periodic_semantic_probe_failed", error=str(exc))
+
+    warmup_task = asyncio.create_task(_periodic_warmup())
+
     logger.info("startup_complete", timestamp=time.time())
     
     yield
     
     # ========== Shutdown ==========
+    warmup_task.cancel()
     logger.info("application_shutdown", timestamp=time.time())
 
 

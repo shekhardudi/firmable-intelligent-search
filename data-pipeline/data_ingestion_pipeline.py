@@ -39,12 +39,14 @@ import os
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Generator
 
 import pandas as pd
+import torch
 import yaml
 from dotenv import load_dotenv
 from opensearchpy import OpenSearch, helpers
@@ -95,7 +97,7 @@ class PipelineConfig:
     chunk_size: int = _yaml_cfg.get("chunk_size", 10_000)
 
     # Docs per OpenSearch HTTP bulk request.
-    # Each doc carries a 768-float vector (~3 KB), so 500 docs ≈ 1.5 MB/request.
+    # Each doc carries a 384-float vector (~1.5 KB), so 500 docs ≈ 750 KB/request.
     bulk_chunk_size: int = _yaml_cfg.get("bulk_chunk_size", 500)
 
     # ---------- Embedding ----------
@@ -106,7 +108,12 @@ class PipelineConfig:
     encode_batch_size: int = _yaml_cfg.get("embedding_batch_size", 64)
 
     # Vector dimension must match the loaded model and the index mapping.
-    embedding_dim: int = _yaml_cfg["embedding"].get("dimension", 768)
+    embedding_dim: int = _yaml_cfg["embedding"].get("dimension", 384)
+
+    # ---------- Parallelism ----------
+    # When True, Stage 5 (embed) for the NEXT chunk runs concurrently with
+    # Stage 7 (bulk insert) for the CURRENT chunk using a thread-pool.
+    parallel_embed_insert: bool = _yaml_cfg.get("parallel_embed_insert", True)
 
 
 # Module-level singleton — used unless the caller supplies an override.
@@ -425,6 +432,7 @@ def build_actions(
                 "searchable_text": searchable_text,
                 "current_employee_estimate": int(row.get("current_employee_estimate", 0)),
                 "total_employee_estimate": int(row.get("total_employee_estimate", 0)),
+                "linkedin_url": row.get("linkedin_url", ""),
                 "vector_embedding": vector,
                 "indexed_at": indexed_at,
                 "ingestion_batch_id": batch_trace_id,
@@ -564,8 +572,27 @@ def run_pipeline(
     total_indexed = 0
     total_failed = 0
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info("pipeline_started", csv=csv_path, batch_trace_id=batch_trace_id,
-                chunk_size=config.chunk_size)
+                chunk_size=config.chunk_size, device=device,
+                parallel=config.parallel_embed_insert)
+
+    # Thread pool for overlapping embedding (GPU/CPU-bound) with bulk insert
+    # (network I/O-bound). Python's GIL is released during both C-level
+    # PyTorch operations and socket I/O, so real concurrency is achieved.
+    executor = ThreadPoolExecutor(max_workers=1) if config.parallel_embed_insert else None
+    pending_insert_future = None  # future for the previous chunk's bulk insert
+
+    def _await_pending() -> None:
+        """Collect the result of a previously submitted bulk insert future."""
+        nonlocal total_indexed, total_failed, pending_insert_future
+        if pending_insert_future is not None:
+            ok, failed = pending_insert_future.result()
+            total_indexed += ok
+            total_failed += failed
+            pending_insert_future = None
+
+    t_pipeline = time.perf_counter()
 
     # ── Stage 1: stream chunks ──────────────────────────────────────────────
     for chunk_num, raw_chunk in enumerate(read_chunks(csv_path, config.chunk_size), start=1):
@@ -602,9 +629,9 @@ def run_pipeline(
         logger.info("pipeline_embedding_started", chunk=chunk_num, records=len(texts),
                     batch_trace_id=batch_trace_id)
         embeddings = create_embeddings(model, texts, config.encode_batch_size, config.embedding_dim)
+        embed_ms = round((time.perf_counter() - t_embed) * 1000, 1)
         logger.info("pipeline_embedding_complete", chunk=chunk_num, records=len(embeddings),
-                    duration_ms=round((time.perf_counter() - t_embed) * 1000, 1),
-                    batch_trace_id=batch_trace_id)
+                    duration_ms=embed_ms, batch_trace_id=batch_trace_id)
 
         # ── Stage 6: build action dicts ─────────────────────────────────────
         actions = build_actions(
@@ -613,27 +640,65 @@ def run_pipeline(
         )
 
         # ── Stage 7: bulk insert ─────────────────────────────────────────────
+        # Wait for the PREVIOUS chunk's insert to finish before submitting
+        # the next one (back-pressure: never queue >1 insert at a time).
+        _await_pending()
+
         t_bulk = time.perf_counter()
         logger.info("pipeline_bulk_insert_started", chunk=chunk_num, docs=len(actions),
                     batch_trace_id=batch_trace_id)
-        ok, failed = bulk_insert_chunk(client, actions, config.bulk_chunk_size)
-        total_indexed += ok
-        total_failed += failed
 
-        logger.info(
-            "pipeline_chunk_complete",
-            chunk=chunk_num, ok=ok, failed=failed,
-            running_total_indexed=total_indexed,
-            bulk_duration_ms=round((time.perf_counter() - t_bulk) * 1000, 1),
-            batch_trace_id=batch_trace_id,
-        )
+        if executor is not None:
+            # Submit bulk insert to the thread pool so Stage 5 for the NEXT
+            # chunk can start on the GPU while the network I/O happens.
+            pending_insert_future = executor.submit(
+                _insert_and_log, client, actions, config.bulk_chunk_size,
+                chunk_num, batch_trace_id, t_bulk,
+            )
+        else:
+            ok, failed = bulk_insert_chunk(client, actions, config.bulk_chunk_size)
+            total_indexed += ok
+            total_failed += failed
+            logger.info(
+                "pipeline_chunk_complete",
+                chunk=chunk_num, ok=ok, failed=failed,
+                running_total_indexed=total_indexed,
+                bulk_duration_ms=round((time.perf_counter() - t_bulk) * 1000, 1),
+                batch_trace_id=batch_trace_id,
+            )
+
+    # ── Drain the last pending insert ──────────────────────────────────────
+    _await_pending()
+    if executor is not None:
+        executor.shutdown(wait=False)
+
+    pipeline_secs = round(time.perf_counter() - t_pipeline, 1)
 
     # ── Post-ingestion: restore settings and merge HNSW segments ───────────
     finalize_index(client, config.index_name)
 
     logger.info("pipeline_complete", indexed=total_indexed, failed=total_failed,
-                batch_trace_id=batch_trace_id)
+                duration_secs=pipeline_secs, batch_trace_id=batch_trace_id)
     return {"indexed": total_indexed, "failed": total_failed}
+
+
+def _insert_and_log(
+    client: OpenSearch,
+    actions: list[dict],
+    bulk_chunk_size: int,
+    chunk_num: int,
+    batch_trace_id: str,
+    t_start: float,
+) -> tuple[int, int]:
+    """Run bulk_insert_chunk and log completion — used by the thread pool."""
+    ok, failed = bulk_insert_chunk(client, actions, bulk_chunk_size)
+    logger.info(
+        "pipeline_chunk_complete",
+        chunk=chunk_num, ok=ok, failed=failed,
+        bulk_duration_ms=round((time.perf_counter() - t_start) * 1000, 1),
+        batch_trace_id=batch_trace_id,
+    )
+    return ok, failed
 
 
 # ===========================================================================
@@ -682,12 +747,13 @@ def create_index(client: OpenSearch, index_name: str) -> None:
 
 def load_embedding_model(model_path: str = CONFIG.model_path) -> SentenceTransformer:
     """
-    Load and return the SentenceTransformer embedding model from local disk.
-    The model path is controlled by the `embedding.model` key in ingest_config.yaml.
+    Load and return the SentenceTransformer embedding model.
+    Automatically uses GPU if available (CUDA).
     """
-    logger.info("model_loading", path=model_path)
-    model = SentenceTransformer(model_path)
-    logger.info("model_loaded")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info("model_loading", path=model_path, device=device)
+    model = SentenceTransformer(model_path, device=device)
+    logger.info("model_loaded", device=device)
     return model
 
 

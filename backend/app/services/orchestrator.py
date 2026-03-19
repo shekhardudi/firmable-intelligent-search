@@ -298,8 +298,10 @@ class SearchOrchestrator:
                 response_headers=response_headers
             )
 
-            # Cache result (skip AGENTIC — time-sensitive external data)
-            if self.settings.ENABLE_CACHING and intent.category != SearchIntent.AGENTIC:
+            # Cache result (skip AGENTIC — time-sensitive external data,
+            # skip bm25_fallback — degraded results should not be served later)
+            is_fallback = search_metadata.get("mode") == "bm25_fallback"
+            if self.settings.ENABLE_CACHING and intent.category != SearchIntent.AGENTIC and not is_fallback:
                 self.cache.set(_cache_key, response.model_dump_json())
             self.cache.track_query(query)
 

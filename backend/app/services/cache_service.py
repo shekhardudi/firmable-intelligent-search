@@ -24,7 +24,7 @@ _FALLBACK_QUERY_COUNTER: Counter = Counter()
 
 
 class CacheService:
-    def __init__(self, redis_url: str, default_ttl: int = 3600):
+    def __init__(self, redis_url: str, default_ttl: int = 300):
         self._ttl = default_ttl
         self._client = None
         self._available = False

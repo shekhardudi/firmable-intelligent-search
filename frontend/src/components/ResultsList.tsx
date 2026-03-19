@@ -59,6 +59,17 @@ function relevanceColor(score: number): string {
   return '#94a3b8';
 }
 
+function titleCase(str: string): string {
+  try {
+    return str
+      .trim()
+      .replace(/\s+/g, ' ')
+      .replace(/\b\w/g, c => c.toUpperCase());
+  } catch {
+    return str;
+  }
+}
+
 // ── Component ─────────────────────────────────────────────────────────────
 
 export default function ResultsList({ results, currentPage, onPageChange, searchQuery }: ResultsListProps) {
@@ -157,7 +168,8 @@ export default function ResultsList({ results, currentPage, onPageChange, search
 }
 
 function CompanyCard({ result }: { result: IntelligentCompanyResult }) {
-  const initials = result.name
+  const displayName = titleCase(result.name);
+  const initials = displayName
     .split(/\s+/)
     .slice(0, 2)
     .map(w => w[0]?.toUpperCase() ?? '')
@@ -186,7 +198,7 @@ function CompanyCard({ result }: { result: IntelligentCompanyResult }) {
         {/* Name + domain + pills */}
         <div className="company-main">
           <div className="company-name-row">
-            <h3 className="company-name">{result.name}</h3>
+            <h3 className="company-name">{displayName}</h3>
             <span className="relevance-dot" style={{ background: relColor }} title={`${Math.round(result.relevance_score * 100)}% match`} />
           </div>
           {result.domain && (
@@ -200,7 +212,7 @@ function CompanyCard({ result }: { result: IntelligentCompanyResult }) {
             ))}
             {[result.locality, result.country].filter(Boolean).length > 0 && (
               <span className="meta-pill meta-pill--location">
-                📍 {[result.locality, result.country].filter(Boolean).join(', ')}
+                📍 {[result.locality, result.country].filter(Boolean).map(s => titleCase(s)).join(', ')}
               </span>
             )}
           </div>
@@ -216,9 +228,28 @@ function CompanyCard({ result }: { result: IntelligentCompanyResult }) {
         <div className="matching-reason">💡 {result.matching_reason}</div>
       )}
 
-      {result.linkedin_profile?.description && (
+      {result.linkedin_profile && Object.values(result.linkedin_profile).some(v => v != null && v !== '') && (
         <div className="company-description">
-          <p>{result.linkedin_profile.description}</p>
+          {result.linkedin_profile.description && (
+            <p>{result.linkedin_profile.description}</p>
+          )}
+          {result.linkedin_profile.headquarters && (
+            <div className="company-detail">🏢 {result.linkedin_profile.headquarters}</div>
+          )}
+          {result.linkedin_profile.company_size && (
+            <div className="company-detail">👥 {result.linkedin_profile.company_size}</div>
+          )}
+          {result.linkedin_profile.industry && (
+            <div className="company-detail">🏭 {result.linkedin_profile.industry}</div>
+          )}
+          {result.linkedin_profile.website && (
+            <div className="company-detail">
+              🌐 <a href={result.linkedin_profile.website} target="_blank" rel="noreferrer">{result.linkedin_profile.website}</a>
+            </div>
+          )}
+          {result.linkedin_profile.founded_year && (
+            <div className="company-detail">📅 Founded {result.linkedin_profile.founded_year}</div>
+          )}
           {result.linkedin_profile.specialties && result.linkedin_profile.specialties.length > 0 && (
             <div className="company-specialties">
               {result.linkedin_profile.specialties.map(s => (

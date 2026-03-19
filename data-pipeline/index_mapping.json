@@ -83,6 +83,10 @@
       "total_employee_estimate": {
         "type": "long"
       },
+      "linkedin_url": {
+        "type": "keyword",
+        "index": false
+      },
       "size_range": {
         "type": "keyword"
       },

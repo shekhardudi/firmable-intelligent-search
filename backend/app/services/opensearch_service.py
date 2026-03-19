@@ -37,7 +37,7 @@ class OpenSearchService:
                     ),
                     use_ssl=True,
                     verify_certs=self.settings.OPENSEARCH_VERIFY_CERTS,
-                    timeout=30,
+                    timeout=60,
                     max_retries=2,
                 )
                 logger.info("opensearch_client_initialized")
@@ -272,6 +272,44 @@ class OpenSearchService:
             logger.error("get_index_stats_failed", index=index, error=str(e))
             return {}
     
+    def warmup_knn(self, index: str) -> bool:
+        """Pre-load HNSW graphs into native memory via the kNN warmup API.
+
+        Without this, the first kNN query after a cold start must load the
+        entire graph from disk, which can exceed the client timeout on large
+        indices (e.g. 7M × 384-dim).  Uses a 5-minute timeout because loading
+        a ~5-7 GB graph from EBS gp3 is I/O-bound.
+
+        Also raises the kNN memory circuit breaker limit from the default 50%
+        to 80% of native memory — on an r6g.large (16 GB, ~8 GB native) this
+        gives the graph ~6.4 GB instead of ~4 GB.
+        """
+        # Raise circuit breaker limit so the full graph fits in native memory
+        try:
+            self.client.cluster.put_settings(body={
+                "persistent": {
+                    "knn.memory.circuit_breaker.limit": "80%",
+                }
+            })
+            logger.info("knn_circuit_breaker_limit_set", limit="80%")
+        except Exception as e:
+            logger.warning("knn_circuit_breaker_setting_failed", error=str(e))
+
+        try:
+            response = self.client.transport.perform_request(
+                "GET",
+                f"/_plugins/_knn/warmup/{index}?timeout=300s",
+            )
+            logger.info(
+                "knn_warmup_completed",
+                index=index,
+                response=response,
+            )
+            return True
+        except Exception as e:
+            logger.warning("knn_warmup_failed", index=index, error=str(e))
+            return False
+
     def close(self):
         """Close the OpenSearch connection"""
         if self._client:

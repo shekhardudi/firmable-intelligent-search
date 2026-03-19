@@ -7,6 +7,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Any, Optional
 from pydantic import BaseModel
+from opensearchpy.exceptions import ConnectionTimeout
 from app.config import get_settings, get_search_config
 
 logger = structlog.get_logger(__name__)
@@ -402,7 +403,13 @@ class SemanticSearchStrategy(SearchStrategy):
     # ------------------------------------------------------------------
 
     def _search_knn(self, context: SearchContext) -> tuple[List[SearchResult], Dict[str, Any]]:
-        """Pure k-NN vector search — single OpenSearch query."""
+        """Pure k-NN vector search with automatic BM25 fallback on timeout.
+
+        With 7M vectors on a single node the HNSW graph can be slow to
+        traverse (or even to load from disk on a cold start).  If kNN
+        times out, we transparently fall back to a BM25 lexical search
+        so the user still gets results.
+        """
         start_time = time.time()
 
         logger.info(
@@ -413,14 +420,56 @@ class SemanticSearchStrategy(SearchStrategy):
         )
 
         try:
-            embedding = self.embeddings.embed(context.optimized_query)
-
-            knn_response = self.opensearch.search(
-                index=get_settings().OPENSEARCH_INDEX_NAME,
-                body=self._build_knn_query(context, embedding),
-                size=context.limit,
-                from_=0,
+            # --- Step 1: Generate embedding ---
+            embed_start = time.time()
+            try:
+                embedding = self.embeddings.embed(context.optimized_query)
+            except Exception as embed_err:
+                logger.error(
+                    "semantic_embedding_failed",
+                    trace_id=context.trace_id,
+                    query=context.optimized_query[:100],
+                    error=str(embed_err),
+                    error_type=type(embed_err).__name__,
+                )
+                raise
+            embed_ms = int((time.time() - embed_start) * 1000)
+            logger.info(
+                "semantic_embedding_completed",
+                trace_id=context.trace_id,
+                embed_ms=embed_ms,
+                embedding_dim=len(embedding) if embedding else 0,
             )
+
+            # --- Step 2: Execute kNN query ---
+            knn_start = time.time()
+            try:
+                knn_body = self._build_knn_query(context, embedding)
+                knn_response = self.opensearch.search(
+                    index=get_settings().OPENSEARCH_INDEX_NAME,
+                    body=knn_body,
+                    size=context.limit,
+                    from_=0,
+                )
+            except ConnectionTimeout:
+                knn_ms = int((time.time() - knn_start) * 1000)
+                logger.warning(
+                    "knn_timeout_falling_back_to_bm25",
+                    trace_id=context.trace_id,
+                    query=context.query[:100],
+                    knn_ms=knn_ms,
+                )
+                return self._bm25_fallback(context, start_time)
+            except Exception as knn_err:
+                logger.error(
+                    "semantic_knn_query_failed",
+                    trace_id=context.trace_id,
+                    query=context.query[:100],
+                    error=str(knn_err),
+                    error_type=type(knn_err).__name__,
+                )
+                raise
+            knn_ms = int((time.time() - knn_start) * 1000)
 
             knn_hits = knn_response.get("hits", {}).get("hits", [])
 
@@ -436,6 +485,8 @@ class SemanticSearchStrategy(SearchStrategy):
                 "total_hits": len(knn_hits),
                 "returned": len(results),
                 "execution_time_ms": int(execution_time * 1000),
+                "embed_ms": embed_ms,
+                "knn_ms": knn_ms,
                 "embedding_dim": len(embedding) if embedding else 0,
                 "score_range": self._get_score_range(results),
             }
@@ -453,8 +504,50 @@ class SemanticSearchStrategy(SearchStrategy):
                 "semantic_search_failed",
                 trace_id=context.trace_id,
                 error=str(e),
+                error_type=type(e).__name__,
+                elapsed_ms=int((time.time() - start_time) * 1000),
             )
             raise
+
+    def _bm25_fallback(self, context: SearchContext, start_time: float) -> tuple[List[SearchResult], Dict[str, Any]]:
+        """BM25 fallback when kNN times out — keeps the query alive."""
+        bm25_body = self._build_bm25_query(context)
+        response = self.opensearch.search(
+            index=get_settings().OPENSEARCH_INDEX_NAME,
+            body=bm25_body,
+            size=context.limit,
+            from_=(context.page - 1) * context.limit,
+        )
+        results = []
+        for hit in response.get("hits", {}).get("hits", []):
+            source = hit.get("_source", {})
+            results.append(SearchResult(
+                company_id=source.get("company_id", hit.get("_id")),
+                company_name=source.get("name"),
+                domain=source.get("domain"),
+                industry=source.get("industry"),
+                country=source.get("country"),
+                locality=source.get("locality"),
+                relevance_score=float(hit.get("_score", 0)),
+                search_method="bm25_fallback",
+                ranking_source="bm25_fallback",
+                matching_reason="BM25 fallback (kNN timed out on large index)",
+                year_founded=source.get("year_founded"),
+                size_range=source.get("size_range"),
+                current_employee_estimate=source.get("current_employee_estimate"),
+            ))
+        execution_time = time.time() - start_time
+        metadata = {
+            "strategy": "bm25_fallback",
+            "mode": "bm25_fallback",
+            "total_hits": response.get("hits", {}).get("total", {}).get("value", 0),
+            "returned": len(results),
+            "execution_time_ms": int(execution_time * 1000),
+            "score_range": self._get_score_range(results),
+            "fallback_reason": "knn_timeout",
+        }
+        logger.info("bm25_fallback_completed", trace_id=context.trace_id, **metadata)
+        return results, metadata
 
     def _process_knn_results(self, hits: List[Dict], context: SearchContext) -> List[SearchResult]:
         """Convert k-NN hits to SearchResult objects."""
@@ -603,10 +696,15 @@ class SemanticSearchStrategy(SearchStrategy):
         """
         filter_clauses = self._build_filters(context.filters)
 
+        rrf_cfg = get_search_config().get("rrf", {})
         knn_params: Dict[str, Any] = {
             "vector": embedding,
-            "k": get_search_config().get("rrf", {}).get("knn_k", 100),
+            "k": rrf_cfg.get("knn_k", 50),
         }
+        # ef_search caps the HNSW search effort — critical for large indices
+        ef_search = rrf_cfg.get("ef_search")
+        if ef_search:
+            knn_params["method_parameters"] = {"ef_search": ef_search}
         if filter_clauses:
             knn_params["filter"] = {"bool": {"must": filter_clauses}}
 

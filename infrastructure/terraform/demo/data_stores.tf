@@ -6,7 +6,7 @@ resource "aws_opensearch_domain" "main" {
   engine_version = "OpenSearch_2.17"
 
   cluster_config {
-    instance_type  = "r6g.large.search"    # 16 GB – fp16-quantized 7M × 384-dim HNSW needs ~7 GB native
+    instance_type  = "r6g.xlarge.search"   # 32 GB – fp16-quantized 7M × 384-dim HNSW needs ~7 GB native, 16 GB native headroom
     instance_count = 1
   }
 

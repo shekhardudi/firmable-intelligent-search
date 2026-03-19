@@ -1,6 +1,7 @@
 rrf:
   k: 60
-  knn_k: 100
+  knn_k: 50
+  ef_search: 128
   fetch_multiplier: 4
 
 semantic:
