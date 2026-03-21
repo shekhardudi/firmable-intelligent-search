@@ -301,8 +301,9 @@ async def top_queries(limit: int = Query(10, ge=1, le=100, description="Number o
 @router.get("/features", tags=["diagnostics"])
 async def get_features():
     """Get available features and capabilities"""
-    from app.config import get_settings
+    from app.config import get_settings, get_search_config
     settings = get_settings()
+
     
     return {
         "features": {
@@ -314,8 +315,8 @@ async def get_features():
         },
         "models": {
             "classifier": settings.OPENAI_MINI_MODEL,
-            "embedding": "msmarco-distilbert-base-tas-b",
-            "embedding_dimension": 768
+            "embedding": get_search_config().get("embedding", {}).get("model", "unknown"),
+            "embedding_dimension": get_search_config().get("embedding", {}).get("dimension", 768)
         },
         "search_strategies": [
             {

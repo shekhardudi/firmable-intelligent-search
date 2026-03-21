@@ -66,6 +66,14 @@ resource "aws_security_group" "opensearch" {
     security_groups = [aws_security_group.ecs_backend.id]
   }
 
+  ingress {
+    description     = "From GPU ingest instances"
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ingest_gpu.id]
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -74,6 +82,24 @@ resource "aws_security_group" "opensearch" {
   }
 
   tags = { Name = "${local.name_prefix}-opensearch" }
+}
+
+# ---------------------------------------------------------------------------
+# GPU Ingest security group — outbound only (no inbound services)
+# ---------------------------------------------------------------------------
+resource "aws_security_group" "ingest_gpu" {
+  name        = "${local.name_prefix}-ingest-gpu"
+  description = "GPU ingest instances - outbound to OpenSearch and VPC endpoints"
+  vpc_id      = aws_vpc.main.id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "${local.name_prefix}-ingest-gpu" }
 }
 
 # ---------------------------------------------------------------------------

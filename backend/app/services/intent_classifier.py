@@ -88,6 +88,7 @@ class IntentClassifier:
             api_key=self.settings.OPENAI_API_KEY,
             http_client=httpx.Client(
                 limits=httpx.Limits(keepalive_expiry=30),
+                timeout=httpx.Timeout(60.0, connect=5.0),
             ),
         )
         

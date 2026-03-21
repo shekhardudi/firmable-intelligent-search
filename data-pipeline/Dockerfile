@@ -1,30 +1,31 @@
-FROM python:3.12.9-slim
+# ── Multi-stage build for minimal image size ──────────────────────────────
+# Stage 1: Build — install all deps including native extensions
+FROM python:3.10-slim AS builder
 
-WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential gcc && \
+    rm -rf /var/lib/apt/lists/*
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    gcc \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements and install
+WORKDIR /build
 COPY requirements.txt .
 
-# 1. Install CPU-only PyTorch (~200 MB vs ~2 GB for CUDA version)
-RUN pip install --no-cache-dir \
-    torch torchvision torchaudio \
-    --index-url https://download.pytorch.org/whl/cpu
+# PyTorch with CUDA 12.4 for GPU-accelerated sentence-transformers on g4dn.xlarge
+RUN pip install --no-cache-dir --prefix=/install \
+    torch \
+    --index-url https://download.pytorch.org/whl/cu124
 
-# 2. Install everything else; pip won't downgrade/upgrade torch since it's
-#    already satisfied.  Works because requirements.txt has no torch pin.
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-# Copy pipeline code and data files
+# Stage 2: Runtime — slim image with only installed packages
+FROM python:3.10-slim
+
+ENV PYTHONUNBUFFERED=1
+
+COPY --from=builder /install /usr/local
+
+WORKDIR /app
 COPY . .
 
-# Create non-root user
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
 

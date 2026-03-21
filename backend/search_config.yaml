@@ -54,12 +54,20 @@ agentic:
   # Maximum company names the LLM may return per extraction call
   max_company_names: 20
   # Token budget for the LLM event-extraction call
-  llm_max_tokens: 1200
+  llm_max_tokens: 1500
   # OpenSearch candidates to fetch per resolved company name
   resolve_per_name: 5
   # Minimum OpenSearch score to accept a resolved company (avoids false matches)
   min_resolve_score: 0.5
+  # Whether to resolve extracted company names against the OpenSearch index.
+  # When true (default), each company name is matched via multi_match to enrich
+  # results with index metadata (domain, industry, country, etc.).
+  # When false, results are returned as synthetic docs with event data only —
+  # useful to reduce latency or when the index is empty / not yet populated.
+  resolve_to_index: false
   # Tavily web-search max results (only used when TAVILY_API_KEY is set)
-  tavily_max_results: 10
+  tavily_max_results: 5
+  # Tavily search depth: "basic" (fast, shallow) or "advanced" (deeper, slower)
+  tavily_search_depth: "basic"
   # Tavily HTTP request timeout in seconds
   tavily_timeout_s: 8

@@ -72,13 +72,14 @@ export const intelligentSearch = async (
   query: string,
   filters?: UserFilters,
   page = 1,
+  signal?: AbortSignal,
   limit = 20,
 ): Promise<IntelligentSearchResponse> => {
   const body: Record<string, unknown> = { query, limit, page, include_reasoning: true };
   if (filters && Object.values(filters).some(v => v !== undefined && v !== '')) {
     body.filters = filters;
   }
-  const response = await api.post('/api/search/intelligent', body);
+  const response = await api.post('/api/search/intelligent', body, { signal });
   return response.data;
 };
 

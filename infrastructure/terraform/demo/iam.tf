@@ -112,3 +112,66 @@ resource "aws_iam_role_policy" "ecs_task_permissions" {
   policy = data.aws_iam_policy_document.ecs_task_permissions.json
 }
 
+# ---------------------------------------------------------------------------
+# EC2 Instance Role for GPU Ingest instances (ECS container instance)
+# ---------------------------------------------------------------------------
+data "aws_iam_policy_document" "ec2_assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "ingest_gpu" {
+  name               = "${local.name_prefix}-ingest-gpu"
+  assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "ingest_gpu_ssm" {
+  role       = aws_iam_role.ingest_gpu.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+data "aws_iam_policy_document" "ingest_gpu_permissions" {
+  # S3 — download pipeline code and CSV from data bucket
+  statement {
+    actions   = ["s3:GetObject", "s3:ListBucket"]
+    resources = [
+      aws_s3_bucket.data.arn,
+      "${aws_s3_bucket.data.arn}/*",
+    ]
+  }
+
+  # Secrets Manager — read OpenSearch password
+  statement {
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.opensearch_password.arn]
+  }
+
+  # ASG — scale self back to 0 after ingestion completes
+  statement {
+    actions   = ["autoscaling:SetDesiredCapacity"]
+    resources = [aws_autoscaling_group.ingest_gpu.arn]
+  }
+
+  # CloudWatch Logs — write ingestion logs
+  statement {
+    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["arn:aws:logs:*:*:log-group:/ecs/firmable*"]
+  }
+}
+
+resource "aws_iam_role_policy" "ingest_gpu_permissions" {
+  name   = "ingest-gpu-permissions"
+  role   = aws_iam_role.ingest_gpu.id
+  policy = data.aws_iam_policy_document.ingest_gpu_permissions.json
+}
+
+resource "aws_iam_instance_profile" "ingest_gpu" {
+  name = "${local.name_prefix}-ingest-gpu"
+  role = aws_iam_role.ingest_gpu.name
+}
+

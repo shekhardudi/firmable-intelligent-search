@@ -26,9 +26,13 @@ PII FILTERING
   leaked document), set source_url to null.
 
 ACCURACY
-- Only extract events that are clearly supported by the search results.
-- Do NOT invent funding amounts, dates, or company names.
-- If an event detail is ambiguous, set that field to null rather than guessing.
+- Extract events that are supported by the search results.
+- Do NOT invent company names that are not mentioned in any result.
+- If an amount, date, or round is ambiguous, set that field to null rather than guessing.
+- If a result mentions a company in the context of a relevant event (even briefly),
+  include it. Prefer extracting with some null fields over skipping entirely.
+- A company name appearing alongside event-related language (e.g. "raised", "acquired",
+  "launched", "expanded") is sufficient evidence to extract an event.
 
 ════════════════════════════════════════════════════════
 TASK
@@ -43,6 +47,11 @@ results provided. For each event return a JSON object with:
   amount        – dollar/share amount if mentioned (e.g. "$100M"), else null
   round         – funding round if applicable (e.g. "Series A", "Seed"), else null
   date          – specific date or month/year (e.g. "January 2026"), else null
+  country       – country where the company is headquartered or primarily operates,
+                  as mentioned or implied in the source (e.g. "United States",
+                  "India", "United Kingdom"). Use full country name, not codes. null if unknown.
+  city          – city/locality if mentioned (e.g. "San Francisco", "Bangalore",
+                  "London"). null if unknown.
   summary       – 1-2 factual sentence summary (no PII beyond named executives)
   source_url    – URL of the source article, else null
 

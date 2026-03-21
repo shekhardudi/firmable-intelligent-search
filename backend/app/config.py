@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     TAVILY_API_KEY: Optional[str] = None
 
     # Search Configuration
-    SEARCH_TIMEOUT: int = 30  # seconds
+    SEARCH_TIMEOUT: int = 90  # seconds (agentic path with linkedin enrichment can take 60s+)
 
     # Features
     ENABLE_SEMANTIC_SEARCH: bool = True

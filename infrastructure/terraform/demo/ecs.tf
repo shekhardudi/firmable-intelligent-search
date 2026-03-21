@@ -25,8 +25,6 @@ resource "aws_ecs_cluster_capacity_providers" "main" {
     capacity_provider = "FARGATE"
     weight            = 1
   }
-
-  # ECS service-linked role is assumed to already exist in the account
 }
 
 # ---------------------------------------------------------------------------
@@ -119,49 +117,138 @@ resource "aws_ecs_task_definition" "backend" {
 }
 
 # ---------------------------------------------------------------------------
-# Data Ingestion Task Definition (one-off ECS run-task)
+# Data Ingestion — GPU EC2 (g4dn.xlarge) running code directly from S3
 # ---------------------------------------------------------------------------
+# No Docker image needed. The instance boots, downloads the data-pipeline
+# code from S3, pip-installs dependencies, runs the pipeline, then shuts down.
+# ASG starts at 0; deploy-all.sh sets desired=1 to trigger ingestion.
+# ---------------------------------------------------------------------------
+
 resource "aws_cloudwatch_log_group" "ingest" {
   name              = "/ecs/${local.name_prefix}/ingest"
   retention_in_days = 7
 }
 
-resource "aws_ecs_task_definition" "ingest" {
-  family                   = "${local.name_prefix}-ingest"
-  network_mode             = "awsvpc"
-  requires_compatibilities = ["FARGATE"]
-  cpu                      = "4096"   # 4 vCPU – SentenceTransformer batch encoding is CPU-bound
-  memory                   = "8192"   # 8 GB  – headroom for model + pandas DataFrames
-  execution_role_arn       = aws_iam_role.ecs_execution.arn
-  task_role_arn            = aws_iam_role.ecs_task.arn
+# ARM64 AMI (Amazon Linux 2023 for Graviton)
+data "aws_ssm_parameter" "al2023_arm" {
+  name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
+}
 
-  container_definitions = jsonencode([
-    {
-      name      = "ingest"
-      image     = var.ingest_image
-      essential = true
+resource "aws_launch_template" "ingest_gpu" {
+  name          = "${local.name_prefix}-ingest-gpu"
+  image_id      = data.aws_ssm_parameter.al2023_arm.value
+  instance_type = "c7g.4xlarge"   # Graviton3, 16 vCPU, 32 GB RAM, BF16
 
-      environment = [
-        { name = "OPENSEARCH_HOST",    value = replace(local.opensearch_endpoint, "https://", "") },
-        { name = "OPENSEARCH_PORT",    value = "443" },
-        { name = "OPENSEARCH_USER",    value = var.opensearch_master_user },
-        { name = "INGEST_CSV_S3_URI",  value = "s3://${aws_s3_bucket.data.bucket}/companies_sorted.csv" },
-      ]
+  iam_instance_profile { arn = aws_iam_instance_profile.ingest_gpu.arn }
 
-      secrets = [
-        { name = "OPENSEARCH_PASSWORD", valueFrom = aws_secretsmanager_secret.opensearch_password.arn },
-      ]
+  network_interfaces {
+    associate_public_ip_address = false
+    security_groups             = [aws_security_group.ingest_gpu.id]
+  }
 
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          "awslogs-group"         = aws_cloudwatch_log_group.ingest.name
-          "awslogs-region"        = var.aws_region
-          "awslogs-stream-prefix" = "ingest"
-        }
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size           = 50   # OS + pip packages + model cache
+      volume_type           = "gp3"
+      delete_on_termination = true
+    }
+  }
+
+  # Download code from S3, install deps, run ingestion, then shutdown
+  user_data = base64encode(<<-USERDATA
+#!/bin/bash
+set -euxo pipefail
+exec > /var/log/ingest.log 2>&1
+
+REGION="${var.aws_region}"
+DATA_BUCKET="${aws_s3_bucket.data.bucket}"
+OPENSEARCH_HOST="${replace(local.opensearch_endpoint, "https://", "")}"
+OPENSEARCH_PORT="443"
+OPENSEARCH_USER="${var.opensearch_master_user}"
+SECRET_ARN="${aws_secretsmanager_secret.opensearch_password.arn}"
+ASG_NAME="${local.name_prefix}-ingest-gpu"
+
+# Fetch OpenSearch password from Secrets Manager
+OPENSEARCH_PASSWORD=$(aws secretsmanager get-secret-value \
+  --secret-id "$SECRET_ARN" --region "$REGION" \
+  --query SecretString --output text)
+
+# Install Python 3.11 + pip (AL2023 ships Python 3.9)
+dnf install -y python3.11 python3.11-pip python3.11-devel gcc gcc-c++
+
+# Download pipeline code from S3
+mkdir -p /opt/ingest && cd /opt/ingest
+aws s3 cp "s3://$DATA_BUCKET/data-pipeline.tar.gz" - | tar xzf -
+
+# Install Python dependencies (CPU-only torch for ARM/Graviton)
+python3.11 -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+python3.11 -m pip install --no-cache-dir -r requirements.txt
+
+# Run the ingestion pipeline
+export OPENSEARCH_HOST OPENSEARCH_PORT OPENSEARCH_USER OPENSEARCH_PASSWORD
+python3.11 data_ingestion_pipeline.py \
+  --csv "s3://$DATA_BUCKET/companies_sorted.csv" \
+  --host "$OPENSEARCH_HOST" \
+  --port "$OPENSEARCH_PORT" \
+  --reset
+
+# Scale ASG back to 0 — instance will be terminated
+aws autoscaling set-desired-capacity \
+  --auto-scaling-group-name "$ASG_NAME" \
+  --desired-capacity 0 \
+  --region "$REGION"
+
+shutdown -h now
+USERDATA
+  )
+
+  tag_specifications {
+    resource_type = "instance"
+    tags          = { Name = "${local.name_prefix}-ingest-gpu" }
+  }
+}
+
+resource "aws_autoscaling_group" "ingest_gpu" {
+  name                = "${local.name_prefix}-ingest-gpu"
+  desired_capacity    = 0   # Starts at 0 — deploy-all.sh sets to 1
+  min_size            = 0
+  max_size            = 1
+  vpc_zone_identifier = aws_subnet.private[*].id
+
+  mixed_instances_policy {
+    instances_distribution {
+      on_demand_base_capacity                  = 1    # Fallback to on-demand if no spot
+      on_demand_percentage_above_base_capacity = 0
+      spot_allocation_strategy                 = "capacity-optimized"
+      spot_max_price                           = "0.80"
+    }
+
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.ingest_gpu.id
+        version            = "$Latest"
+      }
+
+      # Graviton3 instances — Standard quota (64 vCPU available)
+      override {
+        instance_type = "c7g.4xlarge"    # 16 vCPU, 32 GB — best perf/cost
+      }
+      override {
+        instance_type = "c7g.2xlarge"    # 8 vCPU, 16 GB — smaller fallback
+      }
+      override {
+        instance_type = "c6g.4xlarge"    # 16 vCPU, 32 GB — Graviton2 fallback
+      }
+      override {
+        instance_type = "m7g.4xlarge"    # 16 vCPU, 64 GB — memory-rich fallback
       }
     }
-  ])
+  }
+
+  lifecycle {
+    ignore_changes = [desired_capacity]
+  }
 }
 
 # ---------------------------------------------------------------------------

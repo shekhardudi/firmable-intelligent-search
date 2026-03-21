@@ -48,7 +48,7 @@ output "backend_task_definition" {
   value       = aws_ecs_task_definition.backend.arn
 }
 
-output "ingest_task_definition" {
-  description = "Latest data-pipeline ingest task definition ARN."
-  value       = aws_ecs_task_definition.ingest.arn
+output "ingest_gpu_asg_name" {
+  description = "Auto Scaling Group name for GPU ingest instances."
+  value       = aws_autoscaling_group.ingest_gpu.name
 }

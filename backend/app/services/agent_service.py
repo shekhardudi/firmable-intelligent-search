@@ -69,6 +69,8 @@ class CompanyEvent(BaseModel):
     amount: Optional[str] = None
     round: Optional[str] = None
     date: Optional[str] = None
+    country: Optional[str] = None
+    city: Optional[str] = None
     summary: str = ""
     source_url: Optional[str] = None
 
@@ -138,7 +140,19 @@ class SubmitResultsInput(BaseModel):
     )
 
 
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
+def _recover_partial_events(raw: str) -> list[CompanyEvent]:
+    """Try to salvage complete events from truncated JSON output."""
+    import re
+    events: list[CompanyEvent] = []
+    # Find all complete JSON objects in the events array
+    for m in re.finditer(r'\{[^{}]*"company_name"\s*:[^{}]+\}', raw):
+        try:
+            events.append(CompanyEvent.model_validate_json(m.group()))
+        except Exception:
+            continue
+    return events
 
 
 # ── AgentService ─────────────────────────────────────────────────────────────
@@ -168,7 +182,9 @@ class AgentService:
         self._min_resolve_score: float = float(_cfg.get("min_resolve_score", 1.0))
         self._tavily_max_results: int = int(_cfg.get("tavily_max_results", 5))
         self._tavily_timeout_s: int = int(_cfg.get("tavily_timeout_s", 8))
+        self._tavily_search_depth: str = str(_cfg.get("tavily_search_depth", "advanced"))
         self._llm_max_tokens: int = int(_cfg.get("llm_max_tokens", 800))
+        self._resolve_to_index: bool = bool(_cfg.get("resolve_to_index", True))
 
         # Plain OpenAI client used for structured event extraction.
         # Short keepalive_expiry prevents stale connections after long idle.
@@ -177,6 +193,7 @@ class AgentService:
             api_key=openai_api_key,
             http_client=_httpx.Client(
                 limits=_httpx.Limits(keepalive_expiry=30),
+                timeout=_httpx.Timeout(60.0, connect=5.0),
             ),
         )
         self._extraction_model = model
@@ -312,6 +329,7 @@ class AgentService:
                             "api_key": svc._tavily_key,
                             "query": query,
                             "max_results": svc._tavily_max_results,
+                            "search_depth": svc._tavily_search_depth,
                             "include_published_date": True,
                         },
                         timeout=svc._tavily_timeout_s,
@@ -325,6 +343,7 @@ class AgentService:
                         "tavily_search_done",
                         count=len(tavily_hits),
                         query=query[:80],
+                        titles=[h.title[:80] for h in tavily_hits],
                         tavily_ms=int((time.perf_counter() - _t_tav) * 1000),
                     )
                 except Exception as e:
@@ -341,7 +360,7 @@ class AgentService:
             events: list[CompanyEvent] = []
             results_text = "\n\n".join(
                 f"Title: {r.title}\nURL: {r.url}\n"
-                f"Published: {r.published_date or 'unknown'}\nContent: {r.content[:600]}"
+                f"Published: {r.published_date or 'unknown'}\nContent: {r.content[:1200]}"
                 for r in tavily_hits
             )
             user_msg = (
@@ -350,6 +369,7 @@ class AgentService:
                 f"Web search results:\n{results_text}"
             )
             _t_llm = time.perf_counter()
+            raw = ""
             try:
                 llm_resp = svc._openai.chat.completions.create(
                     model=svc._extraction_model,
@@ -375,6 +395,11 @@ class AgentService:
                 )
             except Exception as e:
                 logger.error("event_extraction_failed", error=str(e))
+                # Attempt to recover partial events from truncated JSON
+                if raw:
+                    events = _recover_partial_events(raw)
+                    if events:
+                        logger.info("partial_events_recovered", count=len(events))
 
             if not events:
                 return json.dumps({
@@ -388,73 +413,70 @@ class AgentService:
             seen_ids: set[str] = set()
 
             for event in events:
-                try:
-                    resp = svc._opensearch.search(
-                        index=svc._index,
-                        query={
-                            "multi_match": {
-                                "query": event.company_name,
-                                "fields": ["name^3", "domain"],
-                                "type": "best_fields",
-                                "fuzziness": "AUTO",
-                            }
-                        },
-                        size=svc._resolve_per_name,
-                    )
-                    matched = False
-                    for hit in resp.get("hits", {}).get("hits", []):
-                        doc_id = hit.get("_id")
-                        score = float(hit.get("_score", 0))
-                        if doc_id not in seen_ids and score > svc._min_resolve_score:
-                            seen_ids.add(doc_id)
-                            src = hit["_source"]
-                            doc = EnrichedCompanyDoc(
-                                id=doc_id,
-                                name=src.get("name", event.company_name),
-                                domain=src.get("domain", ""),
-                                industry=src.get("industry", ""),
-                                country=src.get("country", ""),
-                                locality=src.get("locality", ""),
-                                score=score,
-                                event_data=EventData(
-                                    event_type=event.event_type,
-                                    amount=event.amount,
-                                    round=event.round,
-                                    date=event.date,
-                                    summary=event.summary,
-                                    source_url=event.source_url,
-                                ),
-                            )
-                            resolved.append(doc.model_dump())
-                            matched = True
-                            break
+                _event_data = EventData(
+                    event_type=event.event_type,
+                    amount=event.amount,
+                    round=event.round,
+                    date=event.date,
+                    summary=event.summary,
+                    source_url=event.source_url,
+                )
 
-                    if not matched:
-                        # Not in index — synthetic doc with event data only.
-                        synthetic_id = f"synthetic_{hashlib.sha256(event.company_name.encode()).hexdigest()[:16]}"
-                        if synthetic_id not in seen_ids:
-                            seen_ids.add(synthetic_id)
-                            doc = EnrichedCompanyDoc(
-                                id=synthetic_id,
-                                name=event.company_name,
-                                score=1.0,
-                                event_data=EventData(
-                                    event_type=event.event_type,
-                                    amount=event.amount,
-                                    round=event.round,
-                                    date=event.date,
-                                    summary=event.summary,
-                                    source_url=event.source_url,
-                                ),
-                            )
-                            resolved.append(doc.model_dump())
+                matched = False
+                if svc._resolve_to_index:
+                    try:
+                        resp = svc._opensearch.search(
+                            index=svc._index,
+                            query={
+                                "multi_match": {
+                                    "query": event.company_name,
+                                    "fields": ["name^3", "domain"],
+                                    "type": "best_fields",
+                                    "fuzziness": "AUTO",
+                                }
+                            },
+                            size=svc._resolve_per_name,
+                        )
+                        for hit in resp.get("hits", {}).get("hits", []):
+                            doc_id = hit.get("_id")
+                            score = float(hit.get("_score", 0))
+                            if doc_id not in seen_ids and score > svc._min_resolve_score:
+                                seen_ids.add(doc_id)
+                                src = hit["_source"]
+                                doc = EnrichedCompanyDoc(
+                                    id=doc_id,
+                                    name=src.get("name", event.company_name),
+                                    domain=src.get("domain", ""),
+                                    industry=src.get("industry", ""),
+                                    country=src.get("country", ""),
+                                    locality=src.get("locality", ""),
+                                    score=score,
+                                    event_data=_event_data,
+                                )
+                                resolved.append(doc.model_dump())
+                                matched = True
+                                break
+                    except Exception as e:
+                        logger.warning(
+                            "company_resolution_failed",
+                            name=event.company_name,
+                            error=str(e),
+                        )
 
-                except Exception as e:
-                    logger.warning(
-                        "company_resolution_failed",
-                        name=event.company_name,
-                        error=str(e),
-                    )
+                if not matched:
+                    # Not in index or resolution disabled — synthetic doc with event data only.
+                    synthetic_id = f"synthetic_{hashlib.sha256(event.company_name.encode()).hexdigest()[:16]}"
+                    if synthetic_id not in seen_ids:
+                        seen_ids.add(synthetic_id)
+                        doc = EnrichedCompanyDoc(
+                            id=synthetic_id,
+                            name=event.company_name,
+                            country=event.country or "",
+                            locality=event.city or "",
+                            score=1.0,
+                            event_data=_event_data,
+                        )
+                        resolved.append(doc.model_dump())
 
             return json.dumps({"found": len(resolved), "companies": resolved})
 
@@ -470,37 +492,51 @@ class AgentService:
             seen_ids: set[str] = set()
 
             for name in names:
-                try:
-                    resp = svc._opensearch.search(
-                        index=svc._index,
-                        query={
-                            "multi_match": {
-                                "query": name,
-                                "fields": ["name^3", "domain"],
-                                "type": "best_fields",
-                                "fuzziness": "AUTO",
-                            }
-                        },
-                        size=svc._resolve_per_name,
-                    )
-                    for hit in resp.get("hits", {}).get("hits", []):
-                        doc_id = hit.get("_id")
-                        score = float(hit.get("_score", 0))
-                        if doc_id not in seen_ids and score > svc._min_resolve_score:
-                            seen_ids.add(doc_id)
-                            src = hit["_source"]
-                            doc = EnrichedCompanyDoc(
-                                id=doc_id,
-                                name=src.get("name", name),
-                                domain=src.get("domain", ""),
-                                industry=src.get("industry", ""),
-                                country=src.get("country", ""),
-                                locality=src.get("locality", ""),
-                                score=score,
-                            )
-                            results.append(doc.model_dump())
-                except Exception as e:
-                    logger.warning("name_lookup_failed", name=name, error=str(e))
+                matched = False
+                if svc._resolve_to_index:
+                    try:
+                        resp = svc._opensearch.search(
+                            index=svc._index,
+                            query={
+                                "multi_match": {
+                                    "query": name,
+                                    "fields": ["name^3", "domain"],
+                                    "type": "best_fields",
+                                    "fuzziness": "AUTO",
+                                }
+                            },
+                            size=svc._resolve_per_name,
+                        )
+                        for hit in resp.get("hits", {}).get("hits", []):
+                            doc_id = hit.get("_id")
+                            score = float(hit.get("_score", 0))
+                            if doc_id not in seen_ids and score > svc._min_resolve_score:
+                                seen_ids.add(doc_id)
+                                src = hit["_source"]
+                                doc = EnrichedCompanyDoc(
+                                    id=doc_id,
+                                    name=src.get("name", name),
+                                    domain=src.get("domain", ""),
+                                    industry=src.get("industry", ""),
+                                    country=src.get("country", ""),
+                                    locality=src.get("locality", ""),
+                                    score=score,
+                                )
+                                results.append(doc.model_dump())
+                                matched = True
+                    except Exception as e:
+                        logger.warning("name_lookup_failed", name=name, error=str(e))
+
+                if not matched:
+                    synthetic_id = f"synthetic_{hashlib.sha256(name.encode()).hexdigest()[:16]}"
+                    if synthetic_id not in seen_ids:
+                        seen_ids.add(synthetic_id)
+                        doc = EnrichedCompanyDoc(
+                            id=synthetic_id,
+                            name=name,
+                            score=1.0,
+                        )
+                        results.append(doc.model_dump())
 
             return json.dumps({"found": len(results), "companies": results})
 

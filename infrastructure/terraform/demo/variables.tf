@@ -39,11 +39,6 @@ variable "vpc_cidr" {
   default     = "10.0.0.0/16"
 }
 
-variable "ingest_image" {
-  description = "Full ECR image URI for the data-pipeline ingest job (e.g. 123456789.dkr.ecr.ap-southeast-2.amazonaws.com/firmable-ingest:latest)."
-  type        = string
-}
-
 variable "allowed_cidr_for_alb" {
   description = "CIDR allowed to reach the ALB on port 80. Set to your office IP for added security."
   type        = list(string)

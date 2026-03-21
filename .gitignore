@@ -84,3 +84,5 @@ Thumbs.db
 .cache/
 temp/
 tmp/
+
+companies_sorted.csv

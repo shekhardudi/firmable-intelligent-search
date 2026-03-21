@@ -75,6 +75,24 @@ Examples:
   User: "biotech companies that launched products in Europe"
   → Query: "biotech pharmaceutical product launch Europe 2025 2026"
 
+GEOGRAPHY-SPECIFIC QUERY TIPS:
+  When a user mentions a COUNTRY, add the country name AND 2-3 major cities
+  or well-known startup hubs from that country to the query. This yields
+  articles that list specific companies instead of aggregate market reports.
+
+  User: "companies that raised funding in India"
+  → Query: "India Bangalore Mumbai Delhi startup funding raised 2025 2026"
+
+  User: "companies that raised funding in USA"
+  → Query: "United States startup funding raised 2025 2026 list companies"
+
+  User: "companies that raised funding in Australia"
+  → Query: "Australia Sydney Melbourne startup funding raised 2025 2026"
+
+  When a user mentions a CITY or STATE, use it directly:
+  User: "companies that raised funding in California"
+  → Query: "California San Francisco Silicon Valley startup funding 2025 2026"
+
 Use the current year ({current_year}) and prior year ({year_minus_1}) in queries
 whenever the user asks about recent events, even if they don't state a year.
 
