@@ -672,58 +672,90 @@ class AgentService:
             information: description, headquarters, industry, size,
             specialties, and recent updates.
             """
-            # Step 1: Find company in OpenSearch to get linkedin_url
+            import re as _re
+            import requests
+
             linkedin_url: Optional[str] = None
             company_doc: Optional[dict] = None
-            try:
-                resp = svc._opensearch.search(
-                    index=svc._index,
-                    query={
-                        "multi_match": {
-                            "query": company_name,
-                            "fields": ["name^3", "domain"],
-                            "type": "best_fields",
-                            "fuzziness": "AUTO",
-                        }
-                    },
-                    size=1,
-                )
-                hits = resp.get("hits", {}).get("hits", [])
-                if hits:
-                    src = hits[0]["_source"]
-                    linkedin_url = src.get("linkedin_url")
-                    company_doc = {
-                        "id": hits[0].get("_id", ""),
-                        "name": src.get("name", company_name),
-                        "domain": src.get("domain", ""),
-                        "industry": src.get("industry", ""),
-                        "country": src.get("country", ""),
-                        "locality": src.get("locality", ""),
-                        "score": float(hits[0].get("_score", 1.0)),
-                    }
-            except Exception as e:
-                logger.warning("linkedin_opensearch_lookup_failed", name=company_name, error=str(e))
-
-            # Step 2: Resolve LinkedIn URL (from index or fallback slug)
-            if not linkedin_url:
-                import re as _re
-                slug = _re.sub(r"[^a-z0-9-]", "", company_name.lower().replace(" ", "-"))
-                linkedin_url = f"https://www.linkedin.com/company/{slug}"
-                logger.info(
-                    "linkedin_url_fallback",
-                    company=company_name,
-                    fallback_url=linkedin_url,
-                )
-
-            # Step 3: Fetch LinkedIn page content via Tavily extract
             profile_data: Optional[dict] = None
-            if svc._tavily_key:
-                import requests
+            page_content = ""
 
+            # ── Step 1: OpenSearch lookup ONLY when resolve_to_index is on ──
+            if svc._resolve_to_index:
+                try:
+                    resp = svc._opensearch.search(
+                        index=svc._index,
+                        query={
+                            "multi_match": {
+                                "query": company_name,
+                                "fields": ["name^3", "domain"],
+                                "type": "best_fields",
+                                "fuzziness": "AUTO",
+                            }
+                        },
+                        size=1,
+                    )
+                    hits = resp.get("hits", {}).get("hits", [])
+                    if hits:
+                        src = hits[0]["_source"]
+                        linkedin_url = src.get("linkedin_url")
+                        company_doc = {
+                            "id": hits[0].get("_id", ""),
+                            "name": src.get("name", company_name),
+                            "domain": src.get("domain", ""),
+                            "industry": src.get("industry", ""),
+                            "country": src.get("country", ""),
+                            "locality": src.get("locality", ""),
+                            "score": float(hits[0].get("_score", 1.0)),
+                        }
+                except Exception as e:
+                    logger.warning("linkedin_opensearch_lookup_failed",
+                                   name=company_name, error=str(e))
+
+            # ── Step 2: Tavily Search to discover the real LinkedIn URL ──
+            if not linkedin_url and svc._tavily_key:
+                try:
+                    search_resp = requests.post(
+                        "https://api.tavily.com/search",
+                        json={
+                            "api_key": svc._tavily_key,
+                            "query": f"{company_name} LinkedIn company page site:linkedin.com/company",
+                            "max_results": 3,
+                            "include_raw_content": True,
+                        },
+                        timeout=svc._tavily_timeout_s,
+                    )
+                    search_resp.raise_for_status()
+                    search_results = search_resp.json().get("results", [])
+                    for sr in search_results:
+                        sr_url = sr.get("url", "")
+                        if "linkedin.com/company" in sr_url:
+                            linkedin_url = sr_url
+                            # Grab raw content while we have it (saves an extract call)
+                            raw_content = sr.get("raw_content") or sr.get("content", "")
+                            if raw_content and len(raw_content) > 100:
+                                page_content = raw_content
+                            logger.info(
+                                "linkedin_tavily_search_discovered",
+                                company=company_name,
+                                discovered_url=linkedin_url,
+                            )
+                            break
+                    if not linkedin_url:
+                        logger.warning(
+                            "linkedin_tavily_search_no_url",
+                            company=company_name,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "linkedin_tavily_search_failed",
+                        company=company_name,
+                        error=str(e),
+                    )
+
+            # ── Step 3: Tavily Extract to scrape the LinkedIn page ──
+            if linkedin_url and not page_content and svc._tavily_key:
                 url = linkedin_url if linkedin_url.startswith("http") else f"https://{linkedin_url}"
-                page_content = ""
-
-                # --- Attempt A: Tavily Extract (direct page scrape) ---
                 logger.info("linkedin_attempting_scrape", company=company_name, url=url)
                 try:
                     extract_resp = requests.post(
@@ -753,82 +785,82 @@ class AgentService:
                         error=str(e),
                     )
 
-                # --- Attempt B: Tavily Search fallback (snippet from web) ---
-                if not page_content:
-                    try:
-                        search_resp = requests.post(
-                            "https://api.tavily.com/search",
-                            json={
-                                "api_key": svc._tavily_key,
-                                "query": f"{company_name} LinkedIn company profile site:linkedin.com",
-                                "max_results": 3,
-                                "include_raw_content": True,
-                            },
-                            timeout=svc._tavily_timeout_s,
-                        )
-                        search_resp.raise_for_status()
-                        search_results = search_resp.json().get("results", [])
-                        for sr in search_results:
-                            raw_content = sr.get("raw_content") or sr.get("content", "")
-                            if raw_content and len(raw_content) > 100:
-                                page_content = raw_content
-                                logger.info(
-                                    "linkedin_tavily_search_fallback_hit",
-                                    company=company_name,
-                                    source_url=sr.get("url", ""),
-                                )
-                                break
-                        if not page_content:
-                            logger.warning(
-                                "linkedin_tavily_search_fallback_empty",
+            # ── Step 4: General web search fallback (about the company) ──
+            if not page_content and svc._tavily_key:
+                try:
+                    fallback_resp = requests.post(
+                        "https://api.tavily.com/search",
+                        json={
+                            "api_key": svc._tavily_key,
+                            "query": f"{company_name} company overview about",
+                            "max_results": 3,
+                            "include_raw_content": True,
+                        },
+                        timeout=svc._tavily_timeout_s,
+                    )
+                    fallback_resp.raise_for_status()
+                    fallback_results = fallback_resp.json().get("results", [])
+                    for fr in fallback_results:
+                        raw_content = fr.get("raw_content") or fr.get("content", "")
+                        if raw_content and len(raw_content) > 100:
+                            page_content = raw_content
+                            logger.info(
+                                "linkedin_web_fallback_hit",
                                 company=company_name,
+                                source_url=fr.get("url", ""),
                             )
-                    except Exception as e:
+                            break
+                    if not page_content:
                         logger.warning(
-                            "linkedin_tavily_search_fallback_failed",
+                            "linkedin_web_fallback_empty",
                             company=company_name,
-                            error=str(e),
                         )
-
-                # --- Step 4: Extract structured profile with LLM ---
-                if page_content:
-                    try:
-                        user_msg = (
-                            f"Company: {company_name}\n"
-                            f"LinkedIn URL: {url}\n\n"
-                            f"Page content:\n{page_content[:3000]}"
-                        )
-                        llm_resp = svc._openai.chat.completions.create(
-                            model=svc._extraction_model,
-                            messages=[
-                                {"role": "system", "content": _LINKEDIN_EXTRACTION_PROMPT},
-                                {"role": "user", "content": user_msg},
-                            ],
-                            max_tokens=600,
-                            temperature=0,
-                            response_format={"type": "json_object"},
-                        )
-                        raw = llm_resp.choices[0].message.content.strip()
-                        profile_data = LinkedInProfile.model_validate_json(raw).model_dump()
-                        logger.info(
-                            "linkedin_profile_extracted",
-                            company=company_name,
-                            url=url,
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "linkedin_llm_extraction_failed",
-                            company=company_name,
-                            error=str(e),
-                        )
-                else:
+                except Exception as e:
                     logger.warning(
-                        "linkedin_no_page_content",
+                        "linkedin_web_fallback_failed",
                         company=company_name,
-                        url=url,
+                        error=str(e),
                     )
 
-            # Build result
+            # ── Step 5: LLM extraction from whatever content we got ──
+            if page_content:
+                try:
+                    display_url = linkedin_url or "not found"
+                    user_msg = (
+                        f"Company: {company_name}\n"
+                        f"LinkedIn URL: {display_url}\n\n"
+                        f"Page content:\n{page_content[:3000]}"
+                    )
+                    llm_resp = svc._openai.chat.completions.create(
+                        model=svc._extraction_model,
+                        messages=[
+                            {"role": "system", "content": _LINKEDIN_EXTRACTION_PROMPT},
+                            {"role": "user", "content": user_msg},
+                        ],
+                        max_tokens=600,
+                        temperature=0,
+                        response_format={"type": "json_object"},
+                    )
+                    raw = llm_resp.choices[0].message.content.strip()
+                    profile_data = LinkedInProfile.model_validate_json(raw).model_dump()
+                    logger.info(
+                        "linkedin_profile_extracted",
+                        company=company_name,
+                        url=linkedin_url or "web_fallback",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "linkedin_llm_extraction_failed",
+                        company=company_name,
+                        error=str(e),
+                    )
+            else:
+                logger.warning(
+                    "linkedin_no_page_content",
+                    company=company_name,
+                )
+
+            # ── Build result ──
             if company_doc:
                 result = dict(company_doc)
             else:
@@ -844,6 +876,8 @@ class AgentService:
                 }
             if profile_data:
                 result["linkedin_profile"] = profile_data
+            if linkedin_url:
+                result["linkedin_url"] = linkedin_url
 
             return json.dumps({"found": 1, "companies": [result]})
 
