@@ -52,9 +52,11 @@ agentic:
   # Maximum agent iterations before giving up
   agent_max_iterations: 5
   # Maximum company names the LLM may return per extraction call
-  max_company_names: 20
+  max_company_names: 25
+  # Maximum company results to return from the extraction prompt
+  max_company_results: 20
   # Token budget for the LLM event-extraction call
-  llm_max_tokens: 1500
+  llm_max_tokens: 2048
   # OpenSearch candidates to fetch per resolved company name
   resolve_per_name: 5
   # Minimum OpenSearch score to accept a resolved company (avoids false matches)
@@ -66,8 +68,12 @@ agentic:
   # useful to reduce latency or when the index is empty / not yet populated.
   resolve_to_index: false
   # Tavily web-search max results (only used when TAVILY_API_KEY is set)
-  tavily_max_results: 5
+  tavily_max_results: 6
   # Tavily search depth: "basic" (fast, shallow) or "advanced" (deeper, slower)
-  tavily_search_depth: "basic"
+  tavily_search_depth: "advanced"
   # Tavily HTTP request timeout in seconds
   tavily_timeout_s: 8
+  # When true, send the user's original natural-language query to Tavily
+  # as the primary search (agent's constructed query becomes the retry).
+  # When false, use the agent's keyword query first (original query is retry).
+  tavily_prefer_original_query: true

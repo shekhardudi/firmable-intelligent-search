@@ -561,14 +561,14 @@ function extractChips(text: string): IntentChip[] {
 
 // ── AI Thinking Panel ─────────────────────────────────────────────────────
 
-type SearchPhase = 'classifying' | 'searching' | 'ranking';
+type SearchPhase = 'classifying' | 'searching' | 'thinking';
 
-const PHASE_ORDER: SearchPhase[] = ['classifying', 'searching', 'ranking'];
+const PHASE_ORDER: SearchPhase[] = ['classifying', 'searching', 'thinking'];
 
 const PHASE_META: Record<SearchPhase, { label: string; detail: string }> = {
   classifying: { label: 'Understanding your query',  detail: 'Classifying intent with AI…'   },
   searching:   { label: 'Searching companies',        detail: 'Scanning 500k+ companies…'     },
-  ranking:     { label: 'Ranking results',            detail: 'Scoring by relevance…'         },
+  thinking:    { label: 'Thinking',                   detail: 'Analyzing and preparing results…' },
 };
 
 function StepIcon({ state }: { state: 'done' | 'active' | 'pending' }) {
@@ -588,7 +588,7 @@ function AIThinkingPanel({ phase, isAgentic }: { phase: SearchPhase; isAgentic: 
         </div>
         <div>
           <h3 className="ai-thinking-title">
-            {isAgentic ? '🤖 AI Agent Working' : '✨ AI Searching'}
+            {phase === 'thinking' ? '🧠 Thinking' : isAgentic ? '🤖 AI Agent Working' : '✨ AI Searching'}
           </h3>
           <p className="ai-thinking-subtitle">
             {isAgentic ? 'Querying external data sources…' : 'Intelligently processing your query…'}
@@ -920,7 +920,7 @@ export default function App() {
               <ul>
                 <li>"Apple Inc", "IBM Inc", "Google"</li>
                 <li>"tech companies in California"</li>
-                <li>"find me companies that announced fund raising last year in USA"</li>
+                <li>"find me companies that announced fund raising in last year in Australia"</li>
                 <li>"give me more information about Infosys"</li>
               </ul>
             </div>

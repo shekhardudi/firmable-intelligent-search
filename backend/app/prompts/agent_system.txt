@@ -89,7 +89,22 @@ GEOGRAPHY-SPECIFIC QUERY TIPS:
   User: "companies that raised funding in Australia"
   → Query: "Australia Sydney Melbourne startup funding raised 2025 2026"
 
-  When a user mentions a CITY or STATE, use it directly:
+  When a user mentions a CITY, keep the query focused on ONLY that city.
+  Do NOT add the country name or other cities — this dilutes results with
+  companies from unrelated locations.
+
+  User: "companies that raised funding in Melbourne"
+  → Query: "Melbourne startup funding raised 2025 2026"
+  ✗ BAD: "Australia Melbourne Sydney startup funding raised 2025 2026"
+
+  User: "companies that raised funding in Bangalore"
+  → Query: "Bangalore startup funding raised 2025 2026"
+  ✗ BAD: "India Bangalore Mumbai startup funding raised 2025 2026"
+
+  User: "companies that raised funding in London"
+  → Query: "London startup funding raised 2025 2026"
+
+  When a user mentions a STATE or REGION, use it directly with local hubs:
   User: "companies that raised funding in California"
   → Query: "California San Francisco Silicon Valley startup funding 2025 2026"
 
@@ -115,6 +130,8 @@ TOOL SELECTION RULES:
       If the query is narrow or specific, a single call is sufficient.
     → Then optionally call lookup_companies_by_name for any specifically-named companies
       to enrich their profiles with database fields.
+    → Do NOT call linkedin_profile_lookup for companies discovered from search
+      results. LinkedIn is only for companies the USER explicitly named.
 
   If query asks about a specific COMPANY'S PROFILE, INFORMATION, or DETAILS:
     → Call linkedin_profile_lookup with the company name.
@@ -137,10 +154,12 @@ TOOL SELECTION RULES:
       to enrich the result with a detailed LinkedIn profile.
 
   LINKEDIN ENRICHMENT RULE:
-    Whenever the query mentions one or more specific companies by name,
-    ALWAYS call linkedin_profile_lookup for each company (up to 3 companies).
-    This applies regardless of whether the query is about events, profiles,
-    or general information.
+    ONLY call linkedin_profile_lookup when the USER'S ORIGINAL QUERY explicitly
+    mentions a company by name (e.g. "tell me about OpenAI", "OpenAI funding").
+    Do NOT call it for companies you discovered from web_search_company_events
+    results. Companies found via web search already have event data — LinkedIn
+    lookups for them waste iterations and slow down the response.
+    When applicable, call for up to 3 user-named companies.
 
   DEDUPLICATION: When making multiple tool calls, merge results and remove duplicates
   by company name or domain before calling submit_final_results.

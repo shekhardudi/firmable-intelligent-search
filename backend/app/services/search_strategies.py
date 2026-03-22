@@ -22,17 +22,17 @@ class EventData(BaseModel):
     summary: Optional[str] = None
     source_url: Optional[str] = None
 
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "ignore", "coerce_numbers_to_str": True}
 
 
 class SearchResult(BaseModel):
     """Unified search result across all strategies"""
     company_id: str
     company_name: str
-    domain: str
-    industry: str
-    country: str
-    locality: str
+    domain: Optional[str] = ""
+    industry: Optional[str] = ""
+    country: Optional[str] = ""
+    locality: Optional[str] = ""
     relevance_score: float
     search_method: str  # 'regular', 'semantic', 'agentic'
     matching_reason: Optional[str] = None

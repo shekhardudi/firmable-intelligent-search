@@ -352,6 +352,13 @@ class SearchOrchestrator:
             core = _LOCATION_SUFFIX_RE.sub('', q).strip()
             is_regular = len(core.split()) <= 5
 
+        # Short queries (1-3 words) with no semantic/agentic signals are
+        # almost certainly company name lookups — classify as REGULAR.
+        if not is_regular:
+            core = _LOCATION_SUFFIX_RE.sub('', q).strip()
+            if len(core.split()) <= 3:
+                is_regular = True
+
         if not is_regular:
             return None
 

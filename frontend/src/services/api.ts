@@ -4,7 +4,7 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 export const api = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 30000,
+  timeout: 120000,
 });
 
 // ── Result shape returned by /api/search/intelligent ──────────────────────
@@ -91,35 +91,22 @@ export const healthCheck = async () => {
 // ── Client-side autocomplete suggestions ──────────────────────────────────
 const SUGGESTION_LIST = [
   'tech companies in California',
-  'fintech startups in New York',
   'healthcare companies in London',
   'software companies in San Francisco',
   'AI companies in Seattle',
-  'enterprise software companies',
-  'SaaS companies in Europe',
   'biotech companies in Boston',
-  'e-commerce companies in Asia',
   'cybersecurity companies',
   'companies that raised Series B funding',
   'companies with recent IPO',
   'renewable energy companies',
   'manufacturing companies in Germany',
-  'logistics and supply chain companies',
   'media companies in Los Angeles',
   'consulting firms in Chicago',
   'retail companies in UK',
-  'companies founded after 2015',
-  'large enterprise companies over 10000 employees',
-  'small tech startups',
   'companies in Australia',
   'telecommunications companies',
-  'food technology companies',
-  'automotive companies',
-  'financial services companies',
-  'real estate technology companies',
-  'education technology startups',
-  'marketing technology companies',
-  'cloud infrastructure companies',
+  'find me companies that announced fund raising in last year in Australia',
+  'give me more information about Infosys',
 ];
 
 export function getAutocompleteSuggestions(query: string): string[] {

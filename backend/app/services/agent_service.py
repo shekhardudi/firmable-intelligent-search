@@ -100,15 +100,15 @@ class EnrichedCompanyDoc(BaseModel):
     """Final typed output per company — the shape submit_final_results produces."""
     id: str
     name: str
-    domain: str = ""
-    industry: str = ""
-    country: str = ""
-    locality: str = ""
+    domain: Optional[str] = ""
+    industry: Optional[str] = ""
+    country: Optional[str] = ""
+    locality: Optional[str] = ""
     score: float = 1.0
     event_data: Optional[EventData] = None
     linkedin_profile: Optional[dict] = None
 
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "ignore", "coerce_numbers_to_str": True}
 
 
 # ── Tool input schemas ────────────────────────────────────────────────────────
@@ -185,6 +185,12 @@ class AgentService:
         self._tavily_search_depth: str = str(_cfg.get("tavily_search_depth", "advanced"))
         self._llm_max_tokens: int = int(_cfg.get("llm_max_tokens", 800))
         self._resolve_to_index: bool = bool(_cfg.get("resolve_to_index", True))
+        self._max_company_results: int = int(_cfg.get("max_company_results", 20))
+        self._tavily_prefer_original: bool = bool(_cfg.get("tavily_prefer_original_query", True))
+
+        # Original user query — stored per run so that the extraction LLM can
+        # see the user's intent even when the agent rewrites the search query.
+        self._original_query: str = ""
 
         # Plain OpenAI client used for structured event extraction.
         # Short keepalive_expiry prevents stale connections after long idle.
@@ -197,6 +203,9 @@ class AgentService:
             ),
         )
         self._extraction_model = model
+
+        # Per-run company store for fallback recovery with markdown tool results.
+        self._last_run_companies: list[dict] = []
 
         # LangChain agent — imported here to keep startup fast if agentic search
         # is disabled (imports are deferred).
@@ -223,6 +232,8 @@ class AgentService:
             )
             return []
 
+        self._last_run_companies = []
+        self._original_query = query
         _intermediate_steps: list = []  # captured for fallback even on exception
         t0 = time.perf_counter()
 
@@ -279,7 +290,7 @@ class AgentService:
         from langchain.tools import StructuredTool
         from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-        llm = ChatOpenAI(model=model, temperature=0, api_key=api_key)
+        llm = ChatOpenAI(model=model, temperature=0.3, api_key=api_key)
 
         today = date.today()
         prompt = ChatPromptTemplate.from_messages([
@@ -319,6 +330,17 @@ class AgentService:
             """
             tavily_hits: list[TavilyResult] = []
 
+            # Decide primary vs retry query based on config.
+            # When tavily_prefer_original_query is true, Tavily gets the
+            # user's natural-language query first (better for most searches);
+            # the agent's keyword query becomes the zero-result fallback.
+            if svc._tavily_prefer_original and svc._original_query:
+                primary_query = svc._original_query
+                retry_query = query  # agent's constructed query
+            else:
+                primary_query = query  # agent's constructed query
+                retry_query = svc._original_query
+
             if svc._tavily_key:
                 _t_tav = time.perf_counter()
                 try:
@@ -327,7 +349,7 @@ class AgentService:
                         "https://api.tavily.com/search",
                         json={
                             "api_key": svc._tavily_key,
-                            "query": query,
+                            "query": primary_query,
                             "max_results": svc._tavily_max_results,
                             "search_depth": svc._tavily_search_depth,
                             "include_published_date": True,
@@ -342,7 +364,7 @@ class AgentService:
                     logger.info(
                         "tavily_search_done",
                         count=len(tavily_hits),
-                        query=query[:80],
+                        query=primary_query[:80],
                         titles=[h.title[:80] for h in tavily_hits],
                         tavily_ms=int((time.perf_counter() - _t_tav) * 1000),
                     )
@@ -350,11 +372,7 @@ class AgentService:
                     logger.warning("tavily_search_failed", error=str(e))
 
             if not tavily_hits:
-                return json.dumps({
-                    "found": 0,
-                    "message": "No web search results available.",
-                    "companies": [],
-                })
+                return "No web search results available."
 
             # Extract structured events with the LLM.
             events: list[CompanyEvent] = []
@@ -365,7 +383,9 @@ class AgentService:
             )
             user_msg = (
                 f"Today: {date.today().isoformat()}\n"
-                f"User query: {query}\n\n"
+                f"Original user query: {svc._original_query}\n"
+                f"Search query used: {primary_query}\n"
+                f"Max companies to return: {svc._max_company_results}\n\n"
                 f"Web search results:\n{results_text}"
             )
             _t_llm = time.perf_counter()
@@ -382,17 +402,31 @@ class AgentService:
                     response_format={"type": "json_object"},
                 )
                 raw = llm_resp.choices[0].message.content.strip()
-                extraction = EventExtractionResponse.model_validate_json(raw)
-                events = extraction.events
                 _usage = llm_resp.usage
-                logger.info(
-                    "events_extracted",
-                    count=len(events),
-                    query=query[:80],
-                    extraction_ms=int((time.perf_counter() - _t_llm) * 1000),
-                    input_tokens=_usage.prompt_tokens if _usage else None,
-                    output_tokens=_usage.completion_tokens if _usage else None,
-                )
+                finish_reason = llm_resp.choices[0].finish_reason
+
+                if finish_reason == "length":
+                    # Output was truncated — recover complete events from partial JSON
+                    logger.warning(
+                        "extraction_truncated",
+                        query=query[:80],
+                        raw_len=len(raw),
+                        output_tokens=_usage.completion_tokens if _usage else None,
+                    )
+                    events = _recover_partial_events(raw)
+                    if events:
+                        logger.info("partial_events_recovered", count=len(events))
+                else:
+                    extraction = EventExtractionResponse.model_validate_json(raw)
+                    events = extraction.events
+                    logger.info(
+                        "events_extracted",
+                        count=len(events),
+                        query=query[:80],
+                        extraction_ms=int((time.perf_counter() - _t_llm) * 1000),
+                        input_tokens=_usage.prompt_tokens if _usage else None,
+                        output_tokens=_usage.completion_tokens if _usage else None,
+                    )
             except Exception as e:
                 logger.error("event_extraction_failed", error=str(e))
                 # Attempt to recover partial events from truncated JSON
@@ -401,12 +435,87 @@ class AgentService:
                     if events:
                         logger.info("partial_events_recovered", count=len(events))
 
+            # ── Zero-result retry with alternate query ─────────────
+            # If primary query yielded no events, try the other query
+            # variant (original user query or agent's constructed query).
+            if (
+                not events
+                and retry_query
+                and retry_query != primary_query
+                and svc._tavily_key
+            ):
+                logger.info(
+                    "extraction_zero_result_retry",
+                    primary_query=primary_query[:80],
+                    retry_query=retry_query[:80],
+                )
+                _t_retry = time.perf_counter()
+                try:
+                    retry_resp = requests.post(
+                        "https://api.tavily.com/search",
+                        json={
+                            "api_key": svc._tavily_key,
+                            "query": retry_query,
+                            "max_results": svc._tavily_max_results,
+                            "search_depth": svc._tavily_search_depth,
+                            "include_published_date": True,
+                        },
+                        timeout=svc._tavily_timeout_s,
+                    )
+                    retry_resp.raise_for_status()
+                    retry_hits = [
+                        TavilyResult.model_validate(r)
+                        for r in retry_resp.json().get("results", [])
+                    ]
+                    logger.info(
+                        "tavily_retry_done",
+                        count=len(retry_hits),
+                        query=retry_query[:80],
+                        titles=[h.title[:80] for h in retry_hits],
+                        tavily_ms=int((time.perf_counter() - _t_retry) * 1000),
+                    )
+                    if retry_hits:
+                        retry_text = "\n\n".join(
+                            f"Title: {r.title}\nURL: {r.url}\n"
+                            f"Published: {r.published_date or 'unknown'}\n"
+                            f"Content: {r.content[:1200]}"
+                            for r in retry_hits
+                        )
+                        retry_user_msg = (
+                            f"Today: {date.today().isoformat()}\n"
+                            f"Original user query: {svc._original_query}\n"
+                            f"Search query used: {retry_query}\n"
+                            f"Max companies to return: {svc._max_company_results}\n\n"
+                            f"Web search results:\n{retry_text}"
+                        )
+                        retry_llm = svc._openai.chat.completions.create(
+                            model=svc._extraction_model,
+                            messages=[
+                                {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT},
+                                {"role": "user", "content": retry_user_msg},
+                            ],
+                            max_tokens=svc._llm_max_tokens,
+                            temperature=0,
+                            response_format={"type": "json_object"},
+                        )
+                        retry_raw = retry_llm.choices[0].message.content.strip()
+                        retry_finish = retry_llm.choices[0].finish_reason
+                        if retry_finish == "length":
+                            events = _recover_partial_events(retry_raw)
+                        else:
+                            events = EventExtractionResponse.model_validate_json(
+                                retry_raw
+                            ).events
+                        logger.info(
+                            "retry_events_extracted",
+                            count=len(events),
+                            extraction_ms=int((time.perf_counter() - _t_retry) * 1000),
+                        )
+                except Exception as e:
+                    logger.warning("extraction_retry_failed", error=str(e))
+
             if not events:
-                return json.dumps({
-                    "found": 0,
-                    "message": "No structured events could be extracted.",
-                    "companies": [],
-                })
+                return "No structured events could be extracted."
 
             # Resolve each event's company against OpenSearch.
             resolved: list[dict] = []
@@ -478,7 +587,22 @@ class AgentService:
                         )
                         resolved.append(doc.model_dump())
 
-            return json.dumps({"found": len(resolved), "companies": resolved})
+            # Store for _recover_from_steps fallback (markdown observations aren't JSON-parseable)
+            svc._last_run_companies.extend(resolved)
+
+            # Return concise markdown table for the agent (saves tokens vs raw JSON)
+            lines = [f"Found {len(resolved)} companies:\n"]
+            lines.append("| # | Company | Event | Date | Summary |")
+            lines.append("|---|---------|-------|------|---------|")
+            for i, c in enumerate(resolved, 1):
+                ed = c.get("event_data") or {}
+                if isinstance(ed, EventData):
+                    ed = ed.model_dump()
+                lines.append(
+                    f"| {i} | {c.get('name', '?')} | {ed.get('event_type', '')} "
+                    f"| {ed.get('date', '')} | {ed.get('summary', '')[:80]} |"
+                )
+            return "\n".join(lines)
 
         # ── Tool 2: lookup_companies_by_name ──────────────────────────
 
@@ -810,13 +934,21 @@ class AgentService:
 
     def _recover_from_steps(self, steps: list) -> list[dict[str, Any]]:
         """
-        Last-resort fallback: scan all intermediate tool call observations for
-        companies emitted by web_search_company_events or lookup_companies_by_name.
+        Last-resort fallback: collect companies from per-run store (populated by
+        markdown-returning tools) and from JSON observations of other tools.
         Called when the agent did not reach submit_final_results.
         """
         all_companies: list[dict] = []
         seen_ids: set[str] = set()
 
+        # Companies stored during tool execution (handles markdown observations)
+        for c in self._last_run_companies:
+            cid = c.get("id") or c.get("_id", "")
+            if cid and cid not in seen_ids:
+                seen_ids.add(cid)
+                all_companies.append(c)
+
+        # Also parse JSON observations from tools that still return JSON
         for _action, observation in steps:
             if not isinstance(observation, str):
                 continue
@@ -855,10 +987,10 @@ class AgentService:
                     "_id": doc.id,
                     "_score": doc.score,
                     "name": doc.name,
-                    "domain": doc.domain,
-                    "industry": doc.industry,
-                    "country": doc.country,
-                    "locality": doc.locality,
+                    "domain": doc.domain or "",
+                    "industry": doc.industry or "",
+                    "country": doc.country or "",
+                    "locality": doc.locality or "",
                 }
                 if doc.event_data:
                     entry["_event_data"] = doc.event_data.model_dump()
